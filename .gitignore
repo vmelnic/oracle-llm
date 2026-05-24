@@ -1,0 +1,23 @@
+node_modules/
+.venv/
+.env
+*.log
+
+# Native build artifacts
+build/
+prebuilds/
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Training artifacts
+*.safetensors
+*.bin
+*.pt
+checkpoint-*/
+
+# OS
+.DS_Store
+Thumbs.db
