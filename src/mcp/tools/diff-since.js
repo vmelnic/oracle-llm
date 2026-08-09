@@ -16,9 +16,18 @@ export function diffSince(ctx, { ref, scope }) {
 
   let changedFiles;
   try {
-    const args = ['diff', '--name-only', ref];
+    if (typeof ref !== 'string' || ref.length > 200 || /[\0\r\n]/.test(ref)) throw new Error('invalid ref');
+    const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], {
+      cwd: root,
+      encoding: 'utf-8',
+      timeout: 10000,
+    }).trim();
+    const args = ['diff', '--no-ext-diff', '--name-only', commit, '--'];
     if (scope) {
-      args.push('--', scope);
+      if (path.isAbsolute(scope) || path.relative(root, path.resolve(root, scope)).startsWith('..')) {
+        throw new Error('invalid scope');
+      }
+      args.push(scope);
     }
     const output = execFileSync('git', args, { cwd: root, encoding: 'utf-8', timeout: 10000 });
     changedFiles = output.trim().split('\n').filter(Boolean);

@@ -25,7 +25,7 @@ node bin/oracle.js status my-project
 
 # 4. Start MCP server
 node bin/oracle.js serve                       # stdio (for Claude Code, Cursor, etc.)
-node bin/oracle.js serve --transport sse       # SSE (http://localhost:3000/sse)
+node bin/oracle.js serve --transport http      # Streamable HTTP (http://127.0.0.1:3000/mcp)
 ```
 
 ## Configuration
@@ -34,7 +34,8 @@ Copy `.env.example` to `.env`:
 
 ```bash
 ORACLE_HOME=~/.oracle              # data directory
-ORACLE_MCP_PORT=3000               # SSE server port
+ORACLE_MCP_PORT=3000               # Streamable HTTP server port
+ORACLE_MCP_HOST=127.0.0.1          # loopback by default
 ORACLE_MCP_IDLE_TIMEOUT_MINUTES=0  # 0 = no timeout
 ORACLE_MCP_CACHE_SIZE=128          # LRU cache entries
 ORACLE_BM25_K1=1.2                 # BM25 tuning
@@ -43,7 +44,7 @@ ORACLE_MAX_DEPTH=5                 # graph traversal depth
 ORACLE_OUTPUT_FORMAT=toon          # 'toon' (~35% fewer tokens) or 'json'
 
 # L2 semantic embeddings (optional, BM25-only by default)
-ORACLE_EMBEDDINGS=true
+ORACLE_EMBEDDINGS=false
 ORACLE_EMBED_MODEL=jinaai/jina-embeddings-v2-base-code
 ORACLE_EMBED_UNLOAD_TIMEOUT=300  # unload ONNX model after N seconds idle (0 = never)
 # Remote API alternative:
@@ -58,6 +59,13 @@ ORACLE_L3_ENABLED=false
 # ORACLE_L3_API_KEY=
 ```
 
+HTTP is loopback-only by default. Binding to another interface requires
+an `ORACLE_MCP_AUTH_TOKEN` of at least 32 bytes and an explicit
+`ORACLE_MCP_ALLOWED_HOSTS` allowlist. Administrative MCP tools remain disabled over HTTP
+unless `ORACLE_MCP_ADMIN_ENABLED=true` and `ORACLE_ALLOWED_ROOTS` contains the
+canonical roots that may be registered. Put TLS and network policy in front of
+the process for remote deployments; see `SECURITY.md` for the deployment baseline.
+
 ## CLI commands
 
 ```bash
@@ -70,7 +78,7 @@ node bin/oracle.js ingest <workspace_id>
 node bin/oracle.js ingest <workspace_id> --embeddings   # with semantic vectors
 
 # MCP server
-node bin/oracle.js serve [--transport stdio|sse] [--port 3000] [--watch]
+node bin/oracle.js serve [--transport stdio|http] [--host 127.0.0.1] [--port 3000] [--watch]
 
 # Inspection
 node bin/oracle.js status [workspace_id]
@@ -277,7 +285,7 @@ node bin/oracle.js benchmark my-project backend
 node bin/oracle.js benchmark my-project backend --tasks tasks.json --output results.json
 ```
 
-## Proof-of-concept results
+## Historical proof-of-concept results
 
 On a 21-subproject workspace (10,184 nodes, 4,115 edges):
 
@@ -285,9 +293,12 @@ On a 21-subproject workspace (10,184 nodes, 4,115 edges):
 |--------|-------|
 | Tokens per task | ~7,000 avg |
 | Latency | <160ms |
-| Evidence verification | 100% |
+| Evidence verification | 100% in the referenced sample |
 | Token reduction vs baseline | ~9x |
-| L3 synthesis accuracy | 100% (Qwen2.5-Coder-3B-Instruct, zero fine-tuning) |
+| L3 synthesis accuracy | 100% in the referenced sample (Qwen2.5-Coder-3B-Instruct) |
+
+These historical sample results are not an SLA. Run `oracle benchmark` against
+the exact workspace, model, and commit used in a deployment.
 
 ## Supported languages
 

@@ -532,7 +532,7 @@ function extractFunction(node, namespace, filePath, subprojectId, useMap, nodes,
     });
   }
 
-  extractBodyEdges(node, fqn, 'function', filePath, subprojectId, edges);
+  extractBodyEdges(node, fqn, 'function', filePath, subprojectId, edges, nodes);
 }
 
 function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, subprojectId, useMap, isMigration, isServiceProvider, isEventSubscriber, nodes, edges) {
@@ -688,7 +688,7 @@ function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, 
   }
 
   extractConstructorInjections(name, params, parentSymbol, filePath, subprojectId, useMap, namespace, edges);
-  extractBodyEdges(node, symbol, 'method', filePath, subprojectId, edges);
+  extractBodyEdges(node, symbol, 'method', filePath, subprojectId, edges, nodes);
 }
 
 function extractProperty(node, parentSymbol, namespace, filePath, subprojectId, useMap, isEloquentModel, nodes, edges, eloquentColumns, setTable) {
@@ -910,7 +910,7 @@ function extractConstructorInjections(methodName, params, parentSymbol, filePath
   }
 }
 
-function extractBodyEdges(node, sourceSymbol, sourceKind, filePath, subprojectId, edges) {
+function extractBodyEdges(node, sourceSymbol, sourceKind, filePath, subprojectId, edges, nodes) {
   const body = node.namedChildren.find(n => n.type === 'compound_statement');
   if (!body) return;
 

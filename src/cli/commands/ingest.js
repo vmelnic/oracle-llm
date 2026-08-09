@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import path from 'path';
 import fs from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import { loadWorkspace, getSubprojectDir } from '../../scanner/workspace.js';
 import { GraphStore } from '../../graph/store.js';
 import { buildGraph } from '../../graph/builder.js';
@@ -11,6 +11,8 @@ import { PatternCatalogue } from '../../patterns/index.js';
 import { ManifestDrafter } from '../../manifest/index.js';
 import { L2Index } from '../../retrieval/index.js';
 import { processMarkdownFiles } from '../../markdown/index.js';
+import { acquireFileLock } from '../../utils/file-lock.js';
+import { markIngestState } from '../../ingest/state.js';
 
 
 export function ingestCommand() {
@@ -45,19 +47,23 @@ export function ingestCommand() {
       for (const sp of targets) {
         console.log(`\nIngesting ${sp.id} ...`);
         const dir = getSubprojectDir(workspaceId, sp.id);
-        fs.mkdirSync(dir, { recursive: true });
+        fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+        const lock = acquireFileLock(path.join(dir, '.ingest.lock'));
         const dbPath = path.join(dir, 'entity_graph.sqlite');
-        const store = new GraphStore(dbPath);
+        let store;
 
         try {
+          markIngestState(dir, 'building');
+          store = new GraphStore(dbPath);
           const graphStats = await buildGraph(sp, parser, store);
           console.log(`  Entity graph: ${graphStats.filesProcessed} files, ${graphStats.nodesCreated} nodes, ${graphStats.edgesCreated} edges (${graphStats.skipped} skipped)`);
 
           const contracts = createContractRegistry(store);
-          const contractStats = await contracts.index(sp);
+          const surfacesPath = path.join(dir, 'contract_surfaces.json');
+          const previousSurfaces = contracts.loadSurfacesJson(surfacesPath);
+          const contractStats = await contracts.index(sp, { previousSurfaces });
           console.log(`  Contracts: ${contractStats.surfacesIndexed} surfaces indexed`);
 
-          const surfacesPath = path.join(dir, 'contract_surfaces.json');
           contracts.saveSurfacesJson(contractStats.surfaces, surfacesPath);
 
           const patterns = new PatternCatalogue(store);
@@ -65,7 +71,7 @@ export function ingestCommand() {
 
           // Rerank patterns based on recently changed files
           try {
-            const gitOutput = execSync('git diff HEAD@{1} HEAD --name-only', {
+            const gitOutput = execFileSync('git', ['diff', '--name-only', 'HEAD@{1}', 'HEAD', '--'], {
               cwd: sp.root,
               encoding: 'utf-8',
               timeout: 5000,
@@ -89,9 +95,12 @@ export function ingestCommand() {
 
           const embeddingsOpt = opts.embeddings !== undefined ? opts.embeddings : undefined;
           const l2 = new L2Index(store, { indexPath: path.join(dir, 'ast_embed_index.json'), embeddings: embeddingsOpt });
+          l2.load(); // seeds the hash->vector cache so unchanged nodes are not re-embedded
           const l2Stats = await l2.build(sp.id);
           l2.save();
-          const embLabel = l2Stats.vectors > 0 ? ` + ${l2Stats.vectors} vectors` : '';
+          const embLabel = l2Stats.vectors > 0
+            ? ` + ${l2Stats.vectors} vectors (${l2Stats.embedded} embedded, ${l2Stats.reused} cached)`
+            : '';
           console.log(`  L2 index: ${l2Stats.indexed} nodes indexed (BM25${embLabel})`);
 
           const drafter = new ManifestDrafter();
@@ -110,12 +119,15 @@ export function ingestCommand() {
 
           const storeStats = store.stats(sp.id);
           console.log(`  Totals: ${storeStats.totalNodes} nodes, ${storeStats.totalEdges} edges`);
+          markIngestState(dir, 'ready', { nodes: storeStats.totalNodes, edges: storeStats.totalEdges });
 
         } catch (err) {
           console.error(`  ERROR: ${err.message}`);
+          markIngestState(dir, 'failed', { error: err.message });
           failed.push(sp.id);
         } finally {
-          store.close();
+          if (store) store.close();
+          lock.release();
         }
       }
 

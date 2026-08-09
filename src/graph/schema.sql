@@ -63,3 +63,7 @@ CREATE INDEX IF NOT EXISTS idx_edges_subproject_target
 
 CREATE INDEX IF NOT EXISTS idx_edges_subproject_kind
   ON edges(subproject_id, kind);
+
+INSERT INTO schema_version (version)
+SELECT 2
+WHERE NOT EXISTS (SELECT 1 FROM schema_version);

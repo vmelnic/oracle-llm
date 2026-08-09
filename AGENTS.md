@@ -333,6 +333,7 @@ The CLI loads `.env` automatically via `dotenv`. All variables have sensible def
 | `ORACLE_EMBED_API_URL` | _(empty)_ | OpenAI-compatible embedding API endpoint |
 | `ORACLE_EMBED_API_KEY` | _(empty)_ | API key for the embedding service |
 | `ORACLE_EMBED_DIMENSIONS` | `0` | Embedding vector dimensions (0 = use model default) |
+| `ORACLE_EMBED_MAX_NODES` | `0` | Max nodes to embed per subproject (0 = all). Embeddings are cached by content hash — re-ingests only embed changed nodes |
 | `ORACLE_L3_ENABLED` | `false` | Enable L3 neural synthesis |
 | `ORACLE_L3_BASE_URL` | _(empty)_ | OpenAI-compatible model server URL |
 | `ORACLE_L3_MODEL` | _(empty)_ | Model name (e.g. `Qwen/Qwen2.5-Coder-3B-Instruct`) |

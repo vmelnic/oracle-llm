@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import yaml from 'js-yaml';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import fg from 'fast-glob';
 
 export class ManifestDrafter {
@@ -22,7 +23,7 @@ export class ManifestDrafter {
 
   async save(manifest, outputPath) {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, yaml.dump(manifest, { lineWidth: 120, noRefs: true }));
+    atomicWriteFileSync(outputPath, yaml.dump(manifest, { lineWidth: 120, noRefs: true }));
   }
 
   load(manifestPath) {

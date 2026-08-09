@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
-import { relative, join, dirname, resolve, extname } from 'node:path';
-import { execSync } from 'child_process';
+import { relative, join, dirname, resolve, extname, isAbsolute } from 'node:path';
+import { realpath, stat } from 'node:fs/promises';
+import { execFileSync } from 'child_process';
 import fg from 'fast-glob';
 
 const extractorCache = new Map();
@@ -30,22 +31,38 @@ function blobHash(content) {
   return createHash('sha1').update(content).digest('hex');
 }
 
-export async function buildGraph(subproject, parserManager, store, { onlyFiles } = {}) {
+export async function buildGraph(subproject, parserManager, store, options = {}) {
+  const operation = () => buildGraphInternal(subproject, parserManager, store, options);
+  return typeof store.withTransaction === 'function'
+    ? store.withTransaction(operation)
+    : operation();
+}
+
+async function buildGraphInternal(subproject, parserManager, store, { onlyFiles } = {}) {
   const { id: subprojectId, root, language, includeGlobs, excludeGlobs } = subproject;
 
   let commitSha = null;
   try {
-    commitSha = execSync('git rev-parse HEAD', { cwd: root, encoding: 'utf-8', timeout: 5000 }).trim();
+    commitSha = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: root,
+      encoding: 'utf-8',
+      timeout: 5000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
   } catch {}
 
   let files;
+  const realRoot = await realpath(root);
   if (onlyFiles && onlyFiles.length > 0) {
     files = [];
     for (const rel of onlyFiles) {
-      const absPath = join(root, rel);
+      const absPath = resolve(root, rel);
       try {
-        const stat = await import('node:fs').then(fs => fs.promises.stat(absPath));
-        if (stat.isFile()) files.push(absPath);
+        const canonical = await realpath(absPath);
+        const canonicalRelative = relative(realRoot, canonical);
+        if (canonicalRelative.startsWith('..') || isAbsolute(canonicalRelative)) continue;
+        const fileStat = await stat(canonical);
+        if (fileStat.isFile()) files.push(canonical);
       } catch {}
     }
   } else {
@@ -55,16 +72,32 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
       absolute: true,
       onlyFiles: true,
       dot: false,
+      followSymbolicLinks: false,
     });
   }
 
-  const fileHashes = await Promise.all(
-    files.map(async (absPath) => {
-      const content = await readFile(absPath, 'utf-8');
-      const relPath = relative(root, absPath);
-      return { absPath, relPath, content, blobHash: blobHash(content) };
-    })
-  );
+  const maxFiles = parsePositiveInt(process.env.ORACLE_MAX_FILES, 100_000);
+  if (files.length > maxFiles) throw new Error(`File limit exceeded: ${files.length} > ${maxFiles}`);
+
+  const maxFileBytes = parsePositiveInt(process.env.ORACLE_MAX_FILE_BYTES, 5 * 1024 * 1024);
+  const fileHashes = [];
+  let preSkipped = 0;
+  for (const absPath of files) {
+    const fileStat = await stat(absPath);
+    if (fileStat.size > maxFileBytes) {
+      preSkipped++;
+      continue;
+    }
+    const content = await readFile(absPath, 'utf-8');
+    const relPath = relative(root, absPath);
+    fileHashes.push({ absPath, relPath, content, blobHash: blobHash(content) });
+  }
+
+  const presentPaths = new Set(fileHashes.map(file => file.relPath));
+  const deletionCandidates = onlyFiles?.length
+    ? onlyFiles.filter(rel => !presentPaths.has(rel) && store.getFileHash(subprojectId, rel))
+    : store.getIndexedFiles(subprojectId).filter(rel => !presentPaths.has(rel));
+  for (const deletedPath of deletionCandidates) store.deleteFileData(subprojectId, deletedPath);
 
   const staleSet = new Set(
     store.getStaleFiles(
@@ -76,11 +109,27 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
   let filesProcessed = 0;
   let nodesCreated = 0;
   let edgesCreated = 0;
-  let skipped = 0;
+  let skipped = preSkipped;
   const deferredEdges = [];
+  // Symbol resolution cache: `${kind}\x00${symbol}` -> node id | null.
+  // Positive entries are stable for the whole build (each file is processed once).
+  // Negative entries may flip once the file defining the symbol gets processed,
+  // so they are dropped before the deferred pass to allow exactly one retry.
+  const symbolCache = new Map();
+  const provenanceUpgradeNeeded = !onlyFiles && store.findNodes({ subprojectId }).some(node => {
+    if (!node.file_blob_hash) return false;
+    try {
+      const metadata = node.metadata ? JSON.parse(node.metadata) : {};
+      return !metadata._oracle_sources?.includes('graph');
+    } catch {
+      return true;
+    }
+  });
+  const forceFullRebuild = !onlyFiles
+    && (staleSet.size > 0 || deletionCandidates.length > 0 || provenanceUpgradeNeeded);
 
   for (const file of fileHashes) {
-    if (!staleSet.has(file.relPath)) {
+    if (!staleSet.has(file.relPath) && !forceFullRebuild) {
       skipped++;
       continue;
     }
@@ -105,9 +154,6 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
       continue;
     }
 
-    store.deleteEdgesByFile(subprojectId, file.relPath);
-    store.deleteNodesByFile(subprojectId, file.relPath);
-
     let nodes, edges;
     try {
       ({ nodes, edges } = extractor.extract(tree, file.relPath, subprojectId));
@@ -119,18 +165,22 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
     const sqlNodes = extractSqlTables(file.content, file.relPath, subprojectId);
     if (sqlNodes.length > 0) nodes.push(...sqlNodes);
 
-    if (nodes.length > 0) {
-      const nodeIds = store.upsertNodes(
-        nodes.map(n => ({
-          ...n,
-          subprojectId,
-          path: file.relPath,
-          lang,
-          fileBlobHash: file.blobHash,
-          commitSha: n.commitSha ?? commitSha,
-        }))
-      );
+    store.deleteEdgesByFile(subprojectId, file.relPath);
+    const nodeIds = store.replaceNodesByFile(
+      subprojectId,
+      file.relPath,
+      nodes.map(n => ({
+        ...n,
+        subprojectId,
+        path: file.relPath,
+        lang,
+        fileBlobHash: file.blobHash,
+        commitSha: n.commitSha ?? commitSha,
+        metadata: addOracleSource(n.metadata, 'graph'),
+      }))
+    );
 
+    if (nodes.length > 0) {
       if (edges.length > 0) {
         const localSymbolMap = new Map();
         for (let i = 0; i < nodes.length; i++) {
@@ -146,7 +196,7 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
           if (sourceId == null && e.source_symbol) {
             sourceId = localSymbolMap.get(`${e.source_symbol}::${e.source_kind}`)
               || localSymbolMap.get(e.source_symbol)
-              || resolveSymbolId(store, subprojectId, e.source_symbol, e.source_kind);
+              || resolveSymbolId(store, subprojectId, e.source_symbol, e.source_kind, symbolCache);
 
             if (sourceId == null && e.source_kind === 'file' && e.source_symbol === file.relPath) {
               const fileNodes = store.getNodesByFile(subprojectId, file.relPath);
@@ -158,7 +208,7 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
           if (targetId == null && e.target_symbol) {
             targetId = localSymbolMap.get(`${e.target_symbol}::${e.target_kind}`)
               || localSymbolMap.get(e.target_symbol)
-              || resolveSymbolId(store, subprojectId, e.target_symbol, e.target_kind);
+              || resolveSymbolId(store, subprojectId, e.target_symbol, e.target_kind, symbolCache);
 
             if (targetId == null && (e.kind === 'imports' || e.kind === 'depends_on') && e.target_symbol.startsWith('.')) {
               targetId = resolveModulePath(store, subprojectId, file.relPath, e.target_symbol, e.metadata);
@@ -188,25 +238,32 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
   }
 
   if (deferredEdges.length > 0) {
+    // All files are processed now — drop cached misses so each unresolved
+    // symbol is retried exactly once against the complete graph.
+    for (const [key, value] of symbolCache) {
+      if (value == null) symbolCache.delete(key);
+    }
     let deferredResolved = 0;
     for (const e of deferredEdges) {
-      let { sourceId, targetId } = e;
-
+      let sourceId = e.sourceId != null && store.getNode(e.sourceId) ? e.sourceId : null;
       if (sourceId == null && e.source_symbol) {
-        sourceId = resolveSymbolId(store, subprojectId, e.source_symbol, e.source_kind);
-        if (sourceId == null && e.source_kind === 'file') {
-          const fileNodes = store.getNodesByFile(subprojectId, e._sourceFile);
-          const exported = fileNodes.find(n => n.exported);
-          if (exported) sourceId = exported.id;
-          else if (fileNodes.length > 0) sourceId = fileNodes[0].id;
-        }
+        sourceId = resolveSymbolId(store, subprojectId, e.source_symbol, e.source_kind, symbolCache);
       }
 
+      if (sourceId == null && e.source_symbol && e.source_kind === 'file') {
+        const fileNodes = store.getNodesByFile(subprojectId, e._sourceFile);
+        const exported = fileNodes.find(n => n.exported);
+        if (exported) sourceId = exported.id;
+        else if (fileNodes.length > 0) sourceId = fileNodes[0].id;
+      }
+
+      let targetId = e.targetId != null && store.getNode(e.targetId) ? e.targetId : null;
       if (targetId == null && e.target_symbol) {
-        targetId = resolveSymbolId(store, subprojectId, e.target_symbol, e.target_kind);
-        if (targetId == null && (e.kind === 'imports' || e.kind === 'depends_on') && e.target_symbol.startsWith('.')) {
-          targetId = resolveModulePath(store, subprojectId, e._sourceFile, e.target_symbol, e.metadata);
-        }
+        targetId = resolveSymbolId(store, subprojectId, e.target_symbol, e.target_kind, symbolCache);
+      }
+
+      if (targetId == null && (e.kind === 'imports' || e.kind === 'depends_on') && e.target_symbol?.startsWith('.')) {
+        targetId = resolveModulePath(store, subprojectId, e._sourceFile, e.target_symbol, e.metadata);
       }
 
       if (sourceId != null && targetId != null) {
@@ -217,14 +274,36 @@ export async function buildGraph(subproject, parserManager, store, { onlyFiles }
     }
   }
 
-  return { filesProcessed, nodesCreated, edgesCreated, skipped };
+  return { filesProcessed, filesDeleted: deletionCandidates.length, nodesCreated, edgesCreated, skipped };
 }
 
-function resolveSymbolId(store, subprojectId, symbol, kind) {
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function addOracleSource(metadata, source) {
+  let value = {};
+  if (metadata && typeof metadata === 'object') value = { ...metadata };
+  else if (typeof metadata === 'string') {
+    try { value = JSON.parse(metadata); } catch {}
+  }
+  const sources = Array.isArray(value._oracle_sources) ? value._oracle_sources : [];
+  value._oracle_sources = [...new Set([...sources, source])];
+  return value;
+}
+
+function resolveSymbolId(store, subprojectId, symbol, kind, cache) {
+  const cacheKey = cache ? `${kind || ''}\x00${symbol}` : null;
+  if (cache && cache.has(cacheKey)) return cache.get(cacheKey);
+
   const rows = kind
     ? store.locate(subprojectId, symbol, kind)
     : store.locate(subprojectId, symbol);
-  return rows.length > 0 ? rows[0].id : null;
+  const id = rows.length > 0 ? rows[0].id : null;
+
+  if (cache) cache.set(cacheKey, id);
+  return id;
 }
 
 function extractSqlTables(content, filePath, subprojectId) {

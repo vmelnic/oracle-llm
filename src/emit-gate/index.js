@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { execSync, execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import fg from 'fast-glob';
+import os from 'node:os';
 import { createParser } from '../parser/index.js';
 import { GraphStore } from '../graph/store.js';
 import { L2Index } from '../retrieval/index.js';
@@ -28,16 +29,33 @@ export class EmitGate {
     this.l2 = l2;
     this.patterns = patterns;
     this.manifest = manifest;
+    this.executionRoot = subproject?.root || null;
+    this.shadowRoot = null;
   }
 
   async check(diff) {
     const steps = [];
 
-    steps.push(await this.runParseCheck(diff));
-    steps.push(await this.runTypeCheck(diff));
-    steps.push(await this.runValidate(diff));
-    steps.push(await this.runImpact(diff));
-    steps.push(await this.runTests(diff));
+    const inputValidation = this.runInputValidation(diff);
+    steps.push(inputValidation);
+    if (!inputValidation.passed) {
+      return {
+        committable: false,
+        steps,
+        summary: '1 check(s) failed: input-validation',
+      };
+    }
+
+    try {
+      this._createShadowWorkspace(diff);
+      steps.push(await this.runParseCheck(diff));
+      steps.push(await this.runTypeCheck(diff));
+      steps.push(await this.runValidate(diff));
+      steps.push(await this.runImpact(diff));
+      steps.push(await this.runTests(diff));
+    } finally {
+      this._removeShadowWorkspace();
+    }
 
     const failed = steps.filter((s) => !s.passed);
     const committable = failed.length === 0;
@@ -48,6 +66,125 @@ export class EmitGate {
       summary: committable
         ? 'All checks passed — change is safe to commit.'
         : `${failed.length} check(s) failed: ${failed.map((f) => f.name).join(', ')}`,
+    };
+  }
+
+  _createShadowWorkspace(diff) {
+    const root = this.subproject?.root;
+    const changes = diff?.files || [];
+    if (!root || changes.length === 0 || process.env.ORACLE_GATE_USE_SHADOW === 'false') return;
+
+    const shadow = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-gate-'));
+    const excluded = new Set(['.git', 'node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build']);
+    const maxShadowFiles = positiveInt(process.env.ORACLE_GATE_MAX_SHADOW_FILES, 100_000);
+    const maxShadowBytes = positiveInt(process.env.ORACLE_GATE_MAX_SHADOW_BYTES, 1024 * 1024 * 1024);
+    let copiedFiles = 0;
+    let copiedBytes = 0;
+    try {
+      fs.cpSync(root, shadow, {
+        recursive: true,
+        dereference: false,
+        filter(source) {
+          if (source === root) return true;
+          if (excluded.has(path.basename(source))) return false;
+          const sourceStat = fs.lstatSync(source);
+          if (sourceStat.isFile()) {
+            copiedFiles++;
+            copiedBytes += sourceStat.size;
+            if (copiedFiles > maxShadowFiles) throw new Error(`shadow file limit exceeded (${maxShadowFiles})`);
+            if (copiedBytes > maxShadowBytes) throw new Error(`shadow size limit exceeded (${maxShadowBytes} bytes)`);
+          }
+          return true;
+        },
+      });
+
+      for (const dependencyDir of ['node_modules', 'vendor', '.venv', 'venv']) {
+        const source = path.join(root, dependencyDir);
+        const target = path.join(shadow, dependencyDir);
+        if (fs.existsSync(source) && !fs.existsSync(target)) {
+          fs.symlinkSync(source, target, process.platform === 'win32' ? 'junction' : 'dir');
+        }
+      }
+
+      for (const change of changes) {
+        const target = path.join(shadow, change.path);
+        if (change.action === 'delete' || change.deleted === true) {
+          if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+        } else if (typeof change.proposed_code === 'string') {
+          fs.mkdirSync(path.dirname(target), { recursive: true });
+          fs.writeFileSync(target, change.proposed_code, 'utf-8');
+        }
+      }
+      this.shadowRoot = shadow;
+      this.executionRoot = shadow;
+    } catch (err) {
+      try { fs.rmSync(shadow, { recursive: true, force: true }); } catch {}
+      throw new Error(`Failed to prepare isolated emit-gate workspace: ${err.message}`);
+    }
+  }
+
+  _removeShadowWorkspace() {
+    if (!this.shadowRoot) return;
+    const tempRoot = path.resolve(os.tmpdir());
+    const candidate = path.resolve(this.shadowRoot);
+    const relative = path.relative(tempRoot, candidate);
+    if (!relative.startsWith('..') && !path.isAbsolute(relative) && path.basename(candidate).startsWith('oracle-gate-')) {
+      try { fs.rmSync(candidate, { recursive: true, force: true }); } catch {}
+    }
+    this.shadowRoot = null;
+    this.executionRoot = this.subproject?.root || null;
+  }
+
+  runInputValidation(diff) {
+    const start = Date.now();
+    const issues = [];
+    const files = diff?.files;
+    const maxFiles = positiveInt(process.env.ORACLE_GATE_MAX_FILES, 500);
+    const maxCodeBytes = positiveInt(process.env.ORACLE_GATE_MAX_CODE_BYTES, 5 * 1024 * 1024);
+    const maxTotalCodeBytes = positiveInt(process.env.ORACLE_GATE_MAX_TOTAL_CODE_BYTES, 20 * 1024 * 1024);
+    const root = path.resolve(this.subproject?.root || process.cwd());
+    let totalCodeBytes = 0;
+
+    if (!Array.isArray(files)) {
+      issues.push({ severity: 'error', message: 'Diff must contain a files array' });
+    } else if (files.length > maxFiles) {
+      issues.push({ severity: 'error', message: `Diff contains ${files.length} files; limit is ${maxFiles}` });
+    } else {
+      for (const file of files) {
+        if (!file?.path || path.isAbsolute(file.path)) {
+          issues.push({ severity: 'error', file: file?.path, message: 'File path must be relative to the subproject root' });
+          continue;
+        }
+        const resolved = path.resolve(root, file.path);
+        const relative = path.relative(root, resolved);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) {
+          issues.push({ severity: 'error', file: file.path, message: 'File path escapes the subproject root' });
+        }
+        if (hasSymlinkComponent(root, file.path)) {
+          issues.push({ severity: 'error', file: file.path, message: 'File path traverses a symbolic link' });
+        }
+        const isDelete = file.action === 'delete' || file.deleted === true;
+        if (!isDelete && typeof file.proposed_code !== 'string') {
+          issues.push({ severity: 'error', file: file.path, message: 'Each non-delete change must include proposed_code' });
+        }
+        if (typeof file.proposed_code === 'string') {
+          const codeBytes = Buffer.byteLength(file.proposed_code);
+          totalCodeBytes += codeBytes;
+          if (codeBytes > maxCodeBytes) {
+            issues.push({ severity: 'error', file: file.path, message: `Proposed code exceeds ${maxCodeBytes} bytes` });
+          }
+        }
+      }
+      if (totalCodeBytes > maxTotalCodeBytes) {
+        issues.push({ severity: 'error', message: `Total proposed code exceeds ${maxTotalCodeBytes} bytes` });
+      }
+    }
+
+    return {
+      name: 'input-validation',
+      passed: issues.length === 0,
+      issues,
+      durationMs: Date.now() - start,
     };
   }
 
@@ -105,7 +242,7 @@ export class EmitGate {
     const start = Date.now();
     const issues = [];
     const lang = this.subproject?.language || '';
-    const root = this.subproject?.root;
+    const root = this.executionRoot;
     const lspConfig = this.subproject?.lsp || this.manifest?.lsp;
 
     if (lspConfig?.cmd) {
@@ -122,12 +259,23 @@ export class EmitGate {
       const autoCmd = this._detectTypecheckCommand(lang);
       if (autoCmd) {
         try {
-          execSync(autoCmd, {
-            cwd: root,
-            encoding: 'utf-8',
-            timeout: 60000,
-            stdio: ['pipe', 'pipe', 'pipe'],
-          });
+          if (autoCmd.perFile) {
+            for (const file of (diff.files || []).filter(item => item.path?.endsWith(autoCmd.extension) && item.action !== 'delete' && item.deleted !== true)) {
+              execFileSync(autoCmd.command, [...autoCmd.args, path.join(root, file.path)], {
+                cwd: root,
+                encoding: 'utf-8',
+                timeout: 60_000,
+                stdio: ['ignore', 'pipe', 'pipe'],
+              });
+            }
+          } else {
+            execFileSync(autoCmd.command, autoCmd.args, {
+              cwd: root,
+              encoding: 'utf-8',
+              timeout: 60_000,
+              stdio: ['ignore', 'pipe', 'pipe'],
+            });
+          }
         } catch (err) {
           const stderr = err.stderr || err.stdout || '';
           const errors = parseTypecheckOutput(stderr);
@@ -279,43 +427,46 @@ export class EmitGate {
   }
 
   _detectTypecheckCommand(lang) {
-    const root = this.subproject?.root;
+    const root = this.executionRoot;
     if (!root) return null;
 
     if (lang === 'typescript' || lang === 'javascript') {
       if (fs.existsSync(path.join(root, 'tsconfig.json'))) {
-        try { execSync('npx tsc --noEmit', { cwd: root, stdio: 'pipe', timeout: 5000 }); return 'npx tsc --noEmit'; } catch {}
+        const tsc = localBinary(root, 'tsc');
+        if (tsc && commandWorks(tsc, ['--version'], root)) return { command: tsc, args: ['--noEmit'] };
       }
     }
 
     if (lang === 'php') {
-      try { execSync('php -v', { stdio: 'pipe', timeout: 5000 }); return 'php -l'; } catch {}
+      if (commandWorks('php', ['-v'], root)) {
+        return { command: 'php', args: ['-l'], perFile: true, extension: '.php' };
+      }
     }
 
     if (lang === 'dart') {
-      try { execSync('dart analyze --help', { stdio: 'pipe', timeout: 5000 }); return 'dart analyze'; } catch {}
+      if (commandWorks('dart', ['analyze', '--help'], root)) return { command: 'dart', args: ['analyze'] };
     }
 
     if (lang === 'go') {
-      try { execSync('go vet --help', { stdio: 'pipe', timeout: 5000 }); return 'go vet ./...'; } catch {}
+      if (commandWorks('go', ['version'], root)) return { command: 'go', args: ['vet', './...'] };
     }
 
     if (lang === 'rust') {
-      try { execSync('cargo check --help', { stdio: 'pipe', timeout: 5000 }); return 'cargo check'; } catch {}
+      if (commandWorks('cargo', ['--version'], root)) return { command: 'cargo', args: ['check'] };
     }
 
     if (lang === 'java') {
       if (fs.existsSync(path.join(root, 'pom.xml'))) {
-        try { execSync('mvn --version', { stdio: 'pipe', timeout: 5000 }); return 'mvn compile -q'; } catch {}
+        if (commandWorks('mvn', ['--version'], root)) return { command: 'mvn', args: ['compile', '-q'] };
       }
       if (fs.existsSync(path.join(root, 'build.gradle'))) {
-        try { execSync('gradle --version', { stdio: 'pipe', timeout: 5000 }); return 'gradle compileJava -q'; } catch {}
+        if (commandWorks('gradle', ['--version'], root)) return { command: 'gradle', args: ['compileJava', '-q'] };
       }
     }
 
     if (lang === 'python') {
-      try { execSync('mypy --version', { stdio: 'pipe', timeout: 5000 }); return 'mypy --ignore-missing-imports .'; } catch {}
-      try { execSync('pyright --version', { stdio: 'pipe', timeout: 5000 }); return 'pyright'; } catch {}
+      if (commandWorks('mypy', ['--version'], root)) return { command: 'mypy', args: ['--ignore-missing-imports', '.'] };
+      if (commandWorks('pyright', ['--version'], root)) return { command: 'pyright', args: [] };
     }
 
     return null;
@@ -418,7 +569,7 @@ export class EmitGate {
     const start = Date.now();
     const issues = [];
     const testFrameworks = this.manifest?.test_frameworks || [];
-    const root = this.subproject?.root;
+    const root = this.executionRoot;
 
     if (!root || testFrameworks.length === 0) {
       return {
@@ -452,24 +603,24 @@ export class EmitGate {
     }
 
     try {
-      const testFileArgs = affectedTestFiles.map(f => path.relative(root, f));
-      let fullCmd;
+      const testFileArgs = affectedTestFiles.map(f => path.isAbsolute(f) ? path.relative(root, f) : f);
+      let testArgs;
       const lower = testFrameworks[0]?.toLowerCase() || '';
 
       if (lower === 'phpunit') {
         const configFile = fs.existsSync(path.join(root, 'phpunit.xml')) ? 'phpunit.xml' : 'phpunit.xml.dist';
-        fullCmd = `${testCmd} --configuration ${configFile} ${testFileArgs.join(' ')}`;
+        testArgs = [...testCmd.args, '--configuration', configFile, ...testFileArgs];
       } else if (lower === 'jest') {
-        fullCmd = `${testCmd} --runTestsByPath ${testFileArgs.join(' ')}`;
+        testArgs = [...testCmd.args, '--runTestsByPath', ...testFileArgs];
       } else if (lower === 'vitest') {
-        fullCmd = `${testCmd} run ${testFileArgs.join(' ')}`;
+        testArgs = [...testCmd.args, 'run', ...testFileArgs];
       } else if (lower === 'playwright') {
-        fullCmd = `${testCmd} ${testFileArgs.join(' ')}`;
+        testArgs = [...testCmd.args, ...testFileArgs];
       } else {
-        fullCmd = `${testCmd} ${testFileArgs.join(' ')}`;
+        testArgs = [...testCmd.args, ...testFileArgs];
       }
 
-      execSync(fullCmd, {
+      execFileSync(testCmd.command, testArgs, {
         cwd: root,
         encoding: 'utf-8',
         timeout: 120000,
@@ -497,7 +648,7 @@ export class EmitGate {
   }
 
   _findAffectedTests(changedPaths) {
-    const root = this.subproject?.root;
+    const root = this.executionRoot;
     if (!root) return [];
 
     const testFiles = new Set();
@@ -544,7 +695,7 @@ export class EmitGate {
   }
 
   _detectTestCommand(testFrameworks) {
-    const root = this.subproject?.root;
+    const root = this.executionRoot;
     if (!root) return null;
 
     for (const fw of testFrameworks) {
@@ -552,54 +703,58 @@ export class EmitGate {
 
       if (lower === 'phpunit') {
         if (fs.existsSync(path.join(root, 'vendor/bin/phpunit'))) {
-          return 'vendor/bin/phpunit';
+          return { command: path.join(root, 'vendor/bin/phpunit'), args: [] };
         }
-        try { execSync('which phpunit', { stdio: 'pipe', timeout: 3000 }); return 'phpunit'; } catch {}
+        if (commandWorks('phpunit', ['--version'], root)) return { command: 'phpunit', args: [] };
       }
 
       if (lower === 'jest') {
-        try { execSync('npx jest --version', { cwd: root, stdio: 'pipe', timeout: 5000 }); return 'npx jest --no-coverage'; } catch {}
+        const binary = localBinary(root, 'jest');
+        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: ['--no-coverage'] };
       }
 
       if (lower === 'vitest') {
-        try { execSync('npx vitest run --version', { cwd: root, stdio: 'pipe', timeout: 5000 }); return 'npx vitest run'; } catch {}
+        const binary = localBinary(root, 'vitest');
+        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: [] };
       }
 
       if (lower === 'mocha') {
-        try { execSync('npx mocha --version', { cwd: root, stdio: 'pipe', timeout: 5000 }); return 'npx mocha'; } catch {}
+        const binary = localBinary(root, 'mocha');
+        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: [] };
       }
 
       if (lower === 'pytest') {
-        try { execSync('pytest --version', { cwd: root, stdio: 'pipe', timeout: 5000 }); return 'pytest -x'; } catch {}
+        if (commandWorks('pytest', ['--version'], root)) return { command: 'pytest', args: ['-x'] };
       }
 
       if (lower === 'playwright') {
-        try { execSync('npx playwright --version', { cwd: root, stdio: 'pipe', timeout: 5000 }); return 'npx playwright test'; } catch {}
+        const binary = localBinary(root, 'playwright');
+        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: ['test'] };
       }
 
       if (lower === 'flutter_test' || lower === 'dart') {
-        try { execSync('flutter test --help', { cwd: root, stdio: 'pipe', timeout: 5000 }); return 'flutter test'; } catch {}
+        if (commandWorks('flutter', ['test', '--help'], root)) return { command: 'flutter', args: ['test'] };
       }
 
       if (lower === 'go' || lower === 'go_test') {
-        try { execSync('go version', { stdio: 'pipe', timeout: 3000 }); return 'go test'; } catch {}
+        if (commandWorks('go', ['version'], root)) return { command: 'go', args: ['test'] };
       }
 
       if (lower === 'cargo' || lower === 'rust') {
-        try { execSync('cargo --version', { stdio: 'pipe', timeout: 3000 }); return 'cargo test'; } catch {}
+        if (commandWorks('cargo', ['--version'], root)) return { command: 'cargo', args: ['test'] };
       }
 
       if (lower === 'unittest' || lower === 'python') {
-        try { execSync('python -m pytest --version', { stdio: 'pipe', timeout: 3000 }); return 'python -m pytest -x'; } catch {}
-        return 'python -m unittest';
+        if (commandWorks('python', ['-m', 'pytest', '--version'], root)) return { command: 'python', args: ['-m', 'pytest', '-x'] };
+        if (commandWorks('python', ['--version'], root)) return { command: 'python', args: ['-m', 'unittest'] };
       }
 
       if (lower === 'junit' || lower === 'maven') {
-        try { execSync('mvn --version', { stdio: 'pipe', timeout: 3000 }); return 'mvn test -q'; } catch {}
+        if (commandWorks('mvn', ['--version'], root)) return { command: 'mvn', args: ['test', '-q'] };
       }
 
       if (lower === 'gradle') {
-        try { execSync('gradle --version', { stdio: 'pipe', timeout: 3000 }); return 'gradle test'; } catch {}
+        if (commandWorks('gradle', ['--version'], root)) return { command: 'gradle', args: ['test'] };
       }
     }
 
@@ -656,6 +811,40 @@ function parseTypecheckOutput(output) {
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function localBinary(root, name) {
+  const suffix = process.platform === 'win32' ? '.cmd' : '';
+  const candidate = path.join(root, 'node_modules', '.bin', `${name}${suffix}`);
+  return fs.existsSync(candidate) ? candidate : null;
+}
+
+function commandWorks(command, args, cwd) {
+  try {
+    execFileSync(command, args, { cwd, stdio: 'pipe', timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function hasSymlinkComponent(root, relativePath) {
+  let current = root;
+  for (const segment of relativePath.replace(/\\/g, '/').split('/')) {
+    current = path.join(current, segment);
+    if (!fs.existsSync(current)) continue;
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) return true;
+    } catch {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isTestPath(filePath) {

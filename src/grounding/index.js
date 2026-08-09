@@ -1,4 +1,5 @@
 import fs from 'fs';
+import path from 'path';
 
 const DEFAULT_TOKEN_CAP = 400;
 const EXTENDED_CAP_TOOLS = new Set([
@@ -68,9 +69,10 @@ function truncateToTokenCap(obj, cap) {
 }
 
 export class GroundingWrapper {
-  constructor(store, { parser } = {}) {
+  constructor(store, { parser, subprojectRoot } = {}) {
     this.store = store;
     this.parser = parser;
+    this.subprojectRoot = subprojectRoot || null;
   }
 
   wrap(answer, toolName) {
@@ -85,7 +87,7 @@ export class GroundingWrapper {
         verified.push(e);
       } else {
         const patched = this._patchFromL1(e);
-        if (patched) {
+        if (patched && this.verifyEvidence(patched)) {
           verified.push(patched);
         } else {
           failed.push(e);
@@ -100,6 +102,7 @@ export class GroundingWrapper {
       evidence: verified,
       confidence,
       layer: answer.layer || 'L1',
+      ...(answer._l3_synthesis ? { _l3_synthesis: answer._l3_synthesis } : {}),
       ...(failed.length > 0 ? { unverified_evidence: failed } : {}),
     };
 
@@ -114,9 +117,11 @@ export class GroundingWrapper {
         evidence: verified.slice(0, 5),
         confidence: Math.min(confidence, 0.6),
         layer: answer.layer || 'L1',
+        ...(answer._l3_synthesis ? { _l3_synthesis: answer._l3_synthesis } : {}),
         _truncated: true,
         _token_estimate: tokenEst,
         _token_cap: cap,
+        ...(failed.length > 0 ? { _unverified_evidence_count: failed.length } : {}),
         _hint: 'Answer exceeds token cap. Use oracle.read_exact with evidence pointers for full content.',
       };
     }
@@ -128,29 +133,39 @@ export class GroundingWrapper {
     if (!evidence.path) return false;
 
     try {
-      if (!fs.existsSync(evidence.path)) {
-        if (!evidence.subproject_root) return false;
-        const fullPath = `${evidence.subproject_root}/${evidence.path}`;
-        if (!fs.existsSync(fullPath)) return false;
-        evidence.path = fullPath;
+      const root = evidence.subproject_root || this.subprojectRoot;
+      const candidate = path.isAbsolute(evidence.path)
+        ? evidence.path
+        : path.resolve(root || process.cwd(), evidence.path);
+      if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) return false;
+      const resolved = fs.realpathSync(candidate);
+      if (root) {
+        const realRoot = fs.realpathSync(root);
+        const relative = path.relative(realRoot, resolved);
+        if (relative.startsWith('..') || path.isAbsolute(relative)) return false;
       }
 
       if (evidence.line_range) {
-        const content = fs.readFileSync(evidence.path, 'utf-8');
-        const lines = content.split('\n');
+        if (!Array.isArray(evidence.line_range) || evidence.line_range.length !== 2) return false;
         const [start, end] = evidence.line_range;
-        if (start < 1 || end > lines.length) return false;
+        if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || start > end) return false;
+        const content = fs.readFileSync(resolved, 'utf-8');
+        const lines = content.split('\n');
+        if (end > lines.length) return false;
+
+        if (evidence.symbol) {
+          const citedText = lines.slice(start - 1, end).join('\n').toLowerCase();
+          const symbol = String(evidence.symbol).toLowerCase();
+          if (!citedText.includes(symbol)) return false;
+        }
 
         if (this.parser && evidence.symbol) {
-          const ext = '.' + evidence.path.split('.').pop();
-          const lang = this.parser.languageFor(evidence.path);
+          const lang = this.parser.languageFor(resolved);
           if (lang) {
             try {
               const tree = this.parser.parse(content, lang);
               const rootStart = Math.max(0, start - 1);
               const rootEnd = Math.min(lines.length, end);
-              const startByte = lines.slice(0, rootStart).join('\n').length + (rootStart > 0 ? 1 : 0);
-              const endByte = lines.slice(0, rootEnd).join('\n').length;
               const nodeAtRange = tree.rootNode.descendantForPosition(
                 { row: rootStart, column: 0 },
                 { row: rootEnd - 1, column: 0 }
@@ -159,11 +174,11 @@ export class GroundingWrapper {
                 const nodeText = content.slice(nodeAtRange.startIndex, nodeAtRange.endIndex);
                 const symLower = (evidence.symbol || '').toLowerCase();
                 if (symLower && !nodeText.toLowerCase().includes(symLower)) {
-                  return true;
+                  return false;
                 }
               }
             } catch {
-              // AST sanity check failed; still accept if file/line range is valid
+              return false;
             }
           }
         }
@@ -288,7 +303,8 @@ export class GroundingWrapper {
     if (!symbol) return null;
 
     const subprojectId = answerObj.definitions?.[0]?.subproject_id
-      || result.evidence?.[0]?.subproject_id;
+      || result.evidence?.[0]?.subproject_id
+      || result.unverified_evidence?.[0]?.subproject_id;
 
     try {
       let rows = [];
@@ -300,13 +316,16 @@ export class GroundingWrapper {
       }
 
       if (rows.length > 0) {
-        const evidence = rows.slice(0, 5).map(r => ({
-          path: r.path,
-          line_range: [r.start_line, r.end_line],
-          symbol: r.symbol,
-          kind: r.kind,
-          subproject_id: subprojectId,
-        }));
+        const evidence = rows.slice(0, 5)
+          .map(r => ({
+            path: r.path,
+            line_range: [r.start_line, r.end_line],
+            symbol: r.symbol,
+            kind: r.kind,
+            subproject_id: subprojectId,
+          }))
+          .filter(item => this.verifyEvidence(item));
+        if (evidence.length === 0) return null;
         return {
           ...result,
           evidence,
@@ -350,17 +369,21 @@ export class GroundingWrapper {
 
     const residual = {};
     if (answerObj.definitions && answerObj.definitions.length > 0) {
-      residual.definitions = answerObj.definitions.map((d) => ({
-        path: d.path,
-        start_line: d.start_line,
-        end_line: d.end_line,
-      }));
+      const definitions = answerObj.definitions
+        .filter(d => typeof d?.path === 'string' && d.path.length > 0)
+        .map((d) => ({
+          path: d.path,
+          start_line: d.start_line,
+          end_line: d.end_line,
+        }));
+      if (definitions.length > 0) residual.definitions = definitions;
     }
     if (answerObj.candidates && answerObj.candidates.length > 0) {
-      residual.candidates = answerObj.candidates.slice(0, 3).map((c) => ({
-        path: c.path,
-        kind: c.kind,
-      }));
+      const candidates = answerObj.candidates
+        .filter(c => typeof c?.path === 'string' && c.path.length > 0)
+        .slice(0, 3)
+        .map((c) => ({ path: c.path, kind: c.kind }));
+      if (candidates.length > 0) residual.candidates = candidates;
     }
 
     if (Object.keys(residual).length === 0) return null;

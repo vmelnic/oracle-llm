@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { readFileSync } from 'node:fs';
+import { chmodSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -21,9 +21,23 @@ const EDGE_KINDS = new Set([
 export class GraphStore {
   constructor(dbPath) {
     this.db = new Database(dbPath);
+    chmodSync(dbPath, 0o600);
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
+    this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('synchronous = NORMAL');
+    this.db.pragma('wal_autocheckpoint = 1000');
     this._createSchema();
+    const integrity = this.db.pragma('quick_check', { simple: true });
+    if (integrity !== 'ok') {
+      this.db.close();
+      throw new Error(`SQLite integrity check failed: ${integrity}`);
+    }
+    const schemaVersion = this.db.prepare('SELECT MAX(version) AS version FROM schema_version').get()?.version || 0;
+    if (schemaVersion > 2) {
+      this.db.close();
+      throw new Error(`Database schema v${schemaVersion} is newer than supported v2`);
+    }
     this._prepareStatements();
   }
 
@@ -31,6 +45,21 @@ export class GraphStore {
     const schemaPath = join(__dirname, 'schema.sql');
     const sql = readFileSync(schemaPath, 'utf-8');
     this.db.exec(sql);
+  }
+
+  async withTransaction(operation) {
+    if (this.db.inTransaction) return operation();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = await operation();
+      this.db.exec('COMMIT');
+      return result;
+    } catch (err) {
+      if (this.db.inTransaction) {
+        try { this.db.exec('ROLLBACK'); } catch {}
+      }
+      throw err;
+    }
   }
 
   _prepareStatements() {
@@ -60,6 +89,18 @@ export class GraphStore {
 
       deleteNodesByFile: this.db.prepare(`
         DELETE FROM nodes WHERE subproject_id = ? AND path = ?
+      `),
+
+      deleteNodeById: this.db.prepare(`DELETE FROM nodes WHERE id = ?`),
+
+      updateNodeById: this.db.prepare(`
+        UPDATE nodes SET
+          subproject_id = @subprojectId, path = @path, lang = @lang, symbol = @symbol,
+          kind = @kind, parent_id = @parentId, start_line = @startLine,
+          end_line = @endLine, exported = @exported, signature = @signature,
+          doc = @doc, commit_sha = @commitSha, file_blob_hash = @fileBlobHash,
+          metadata = @metadata
+        WHERE id = @id
       `),
 
       upsertEdge: this.db.prepare(`
@@ -99,6 +140,9 @@ export class GraphStore {
         ON CONFLICT(subproject_id, path)
         DO UPDATE SET blob_hash = excluded.blob_hash, last_indexed_at = excluded.last_indexed_at
       `),
+
+      getIndexedFiles: this.db.prepare(`SELECT path FROM file_hashes WHERE subproject_id = ?`),
+      deleteFileHash: this.db.prepare(`DELETE FROM file_hashes WHERE subproject_id = ? AND path = ?`),
 
       getSymbolsInRange: this.db.prepare(`
         SELECT * FROM nodes
@@ -194,6 +238,45 @@ export class GraphStore {
     return insert(nodes);
   }
 
+  replaceNodesByFile(subprojectId, filePath, nodes) {
+    const replace = this.db.transaction(() => {
+      const existing = this.getNodesByFile(subprojectId, filePath);
+      const used = new Set();
+      const matches = [];
+
+      for (const node of nodes) {
+        const normalized = this._normalizeNode(node);
+        let match = existing.find(row => !used.has(row.id)
+          && row.symbol === normalized.symbol
+          && row.kind === normalized.kind
+          && (row.signature || null) === normalized.signature);
+        if (!match) {
+          match = existing.find(row => !used.has(row.id)
+            && row.symbol === normalized.symbol
+            && row.kind === normalized.kind);
+        }
+        if (match) used.add(match.id);
+        matches.push({ normalized, match });
+      }
+
+      for (const row of existing) {
+        if (!used.has(row.id)) this._stmts.deleteNodeById.run(row.id);
+      }
+
+      const ids = [];
+      for (const { normalized, match } of matches) {
+        if (match) {
+          this._stmts.updateNodeById.run({ ...normalized, id: match.id });
+          ids.push(match.id);
+        } else {
+          ids.push(this._stmts.upsertNode.get(normalized).id);
+        }
+      }
+      return ids;
+    });
+    return replace();
+  }
+
   findNodes({ subprojectId, symbol, kind, path, exported }) {
     const clauses = ['subproject_id = @subprojectId'];
     const params = { subprojectId };
@@ -229,6 +312,10 @@ export class GraphStore {
 
   deleteNodesByFile(subprojectId, path) {
     return this._stmts.deleteNodesByFile.run(subprojectId, path);
+  }
+
+  deleteNode(nodeId) {
+    return this._stmts.deleteNodeById.run(nodeId);
   }
 
   updateNodeMetadata(nodeId, metadata) {
@@ -296,6 +383,23 @@ export class GraphStore {
 
   setFileHash(subprojectId, path, blobHash) {
     this._stmts.setFileHash.run(subprojectId, path, blobHash, new Date().toISOString());
+  }
+
+  getIndexedFiles(subprojectId) {
+    return this._stmts.getIndexedFiles.all(subprojectId).map(row => row.path);
+  }
+
+  deleteFileData(subprojectId, filePath) {
+    const remove = this.db.transaction(() => {
+      this._stmts.deleteEdgesByFile.run(subprojectId, filePath);
+      this._stmts.deleteNodesByFile.run(subprojectId, filePath);
+      this._stmts.deleteFileHash.run(subprojectId, filePath);
+    });
+    remove();
+  }
+
+  clearEdges(subprojectId) {
+    this._stmts.clearSubproject.run(subprojectId);
   }
 
   getStaleFiles(subprojectId, fileHashes) {

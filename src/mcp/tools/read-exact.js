@@ -29,14 +29,8 @@ function resolveSubprojectPath(workspaceRoot, subprojectRoot, filePath) {
   const realBase = (() => {
     try { return fs.realpathSync(base); } catch { return base; }
   })();
-  const realWs = (() => {
-    try { return fs.realpathSync(workspaceRoot || process.cwd()); } catch { return workspaceRoot || process.cwd(); }
-  })();
-
   const relativeToSub = path.relative(realBase, real);
-  const relativeToWs = path.relative(realWs, real);
-
-  if (relativeToSub.startsWith('..') && relativeToWs.startsWith('..')) {
+  if (relativeToSub.startsWith('..') || path.isAbsolute(relativeToSub)) {
     throw new Error(`Path ${filePath} escapes subproject scope`);
   }
   return real;
@@ -61,6 +55,9 @@ export function readExact(ctx, { path: filePath, line_range }) {
 
   if (!fs.existsSync(resolved)) {
     return { answer: { error: 'file not found', path: resolved }, evidence: [], layer: 'L1' };
+  }
+  if (!fs.statSync(resolved).isFile()) {
+    return { answer: { error: 'path is not a regular file', path: resolved }, evidence: [], layer: 'L1' };
   }
 
   let content;
@@ -96,7 +93,24 @@ export function readExact(ctx, { path: filePath, line_range }) {
     };
   }
 
+  const maxLines = positiveInt(process.env.ORACLE_READ_EXACT_MAX_LINES, 2000);
+  if (end - start + 1 > maxLines) {
+    return {
+      answer: { error: 'range too large', max_lines: maxLines, requested_lines: end - start + 1 },
+      evidence: [],
+      layer: 'L1',
+    };
+  }
+
   const selected = allLines.slice(start - 1, end);
+  const maxBytes = positiveInt(process.env.ORACLE_READ_EXACT_MAX_BYTES, 1024 * 1024);
+  if (Buffer.byteLength(selected.join('\n')) > maxBytes) {
+    return {
+      answer: { error: 'response too large', max_bytes: maxBytes },
+      evidence: [],
+      layer: 'L1',
+    };
+  }
   const ext = path.extname(resolved).toLowerCase();
   const lang = LANG_MAP[ext] ?? null;
 
@@ -116,4 +130,9 @@ export function readExact(ctx, { path: filePath, line_range }) {
     evidence,
     layer: 'L1',
   };
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }

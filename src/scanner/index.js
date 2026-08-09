@@ -27,7 +27,7 @@ const DEFAULT_EXCLUDE = [
 ];
 
 function sanitizeId(name) {
-  return name.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  return name.replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '') || 'workspace';
 }
 
 function readJson(filePath) {
@@ -242,7 +242,7 @@ function isNestedUnder(candidatePath, existingPaths) {
 }
 
 export async function detectSubprojects(rootPath) {
-  const absoluteRoot = path.resolve(rootPath);
+  const absoluteRoot = fs.realpathSync(path.resolve(rootPath));
 
   const patterns = BUILD_MANIFESTS.map(m => `**/${m}`);
   const entries = await fg(patterns, {
@@ -251,9 +251,20 @@ export async function detectSubprojects(rootPath) {
     absolute: false,
     onlyFiles: true,
     dot: false,
+    followSymbolicLinks: false,
   });
 
-  entries.sort((a, b) => {
+  const safeEntries = entries.filter(entry => {
+    try {
+      const target = fs.realpathSync(path.join(absoluteRoot, entry));
+      const relative = path.relative(absoluteRoot, target);
+      return !relative.startsWith('..') && !path.isAbsolute(relative);
+    } catch {
+      return false;
+    }
+  });
+
+  safeEntries.sort((a, b) => {
     const depthA = a.split('/').length;
     const depthB = b.split('/').length;
     return depthA - depthB;
@@ -261,7 +272,7 @@ export async function detectSubprojects(rootPath) {
 
   const accepted = [];
 
-  for (const entry of entries) {
+  for (const entry of safeEntries) {
     const absoluteManifest = path.join(absoluteRoot, entry);
     if (!isNestedUnder(absoluteManifest, accepted.map(a => a.absoluteManifest))) {
       accepted.push({ entry, absoluteManifest });
@@ -292,7 +303,7 @@ export async function detectSubprojects(rootPath) {
 }
 
 export async function scanWorkspace(rootPath) {
-  const absoluteRoot = path.resolve(rootPath);
+  const absoluteRoot = fs.realpathSync(path.resolve(rootPath));
   const id = sanitizeId(path.basename(absoluteRoot));
   const subprojects = await detectSubprojects(absoluteRoot);
 

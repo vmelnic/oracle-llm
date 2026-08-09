@@ -16,25 +16,26 @@ function serializeObject(obj, depth) {
   const lines = []
 
   for (const [key, value] of entries) {
+    const safeKey = formatKey(key)
     if (value === null) {
-      lines.push(`${pad}${key}: -`)
+      lines.push(`${pad}${safeKey}: -`)
     } else if (Array.isArray(value)) {
       const arrResult = serializeArray(value, depth + 1)
       if (arrResult.tabular) {
-        lines.push(`${pad}${key}: ${arrResult.text}`)
+        lines.push(`${pad}${safeKey}: ${arrResult.text}`)
       } else {
-        lines.push(`${pad}${key}: ${arrResult.text}`)
+        lines.push(`${pad}${safeKey}: ${arrResult.text}`)
       }
     } else if (typeof value === 'object') {
       const nested = serializeObject(value, depth + 1)
       if (nested.includes('\n')) {
-        lines.push(`${pad}${key}:`)
+        lines.push(`${pad}${safeKey}:`)
         lines.push(nested)
       } else {
-        lines.push(`${pad}${key}: ${nested.trim()}`)
+        lines.push(`${pad}${safeKey}: ${nested.trim()}`)
       }
     } else {
-      lines.push(`${pad}${key}: ${formatVal(value)}`)
+      lines.push(`${pad}${safeKey}: ${formatVal(value)}`)
     }
   }
 
@@ -57,7 +58,7 @@ function serializeArray(arr, depth) {
     if (item && typeof item === 'object' && !Array.isArray(item)) {
       const pairs = Object.entries(item)
         .filter(([, v]) => v !== undefined && v !== null)
-        .map(([k, v]) => `${k}:${formatVal(v)}`)
+        .map(([k, v]) => `${formatKey(k)}:${formatVal(v)}`)
       return `${pad}- {${pairs.join(', ')}}`
     }
     return `${pad}- ${formatVal(item)}`
@@ -80,7 +81,7 @@ function isTabularizable(arr) {
 function tabularize(arr, depth) {
   const keys = collectKeys(arr)
   const pad = '  '.repeat(depth)
-  const header = `[${arr.length}]{${keys.join(',')}}:`
+  const header = `[${arr.length}]{${keys.map(formatKey).join(',')}}:`
   const rows = arr.map(item =>
     `${pad}${keys.map(k => formatVal(item[k])).join(',')}`
   )
@@ -105,10 +106,14 @@ function formatVal(v) {
   if (Array.isArray(v)) return `[${v.map(x => formatVal(x)).join(',')}]`
   if (typeof v === 'string') {
     if (/^[\w./:@_-]+$/.test(v) && v.length > 0 && v.length < 200) return v
-    return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+    return `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n').replace(/\t/g, '\\t')}"`
   }
   if (typeof v === 'object') return JSON.stringify(v)
   return String(v)
+}
+
+function formatKey(value) {
+  return /^[a-zA-Z_][\w.-]*$/.test(value) ? value : JSON.stringify(value)
 }
 
 export function estimateToonSavings(obj) {

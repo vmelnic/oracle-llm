@@ -3,6 +3,8 @@ import path from 'path'
 import http from 'http'
 import https from 'https'
 import { URL } from 'url'
+import { createHash } from 'node:crypto'
+import { atomicWriteFileSync } from '../utils/atomic-write.js'
 import { Bm25Index } from './bm25.js'
 
 const EMBED_MODEL = process.env.ORACLE_EMBED_MODEL || ''
@@ -10,6 +12,10 @@ const EMBED_API_URL = process.env.ORACLE_EMBED_API_URL || ''
 const EMBED_API_KEY = process.env.ORACLE_EMBED_API_KEY || ''
 const EMBED_DIMENSIONS = parseInt(process.env.ORACLE_EMBED_DIMENSIONS || '0', 10)
 const EMBEDDINGS_ENV = process.env.ORACLE_EMBEDDINGS || ''
+// Max nodes to embed; 0 = embed all nodes
+const EMBED_MAX_NODES = parseInt(process.env.ORACLE_EMBED_MAX_NODES || '0', 10)
+// Chunk size for remote embedding API requests
+const EMBED_API_BATCH = 256
 
 export class L2Index {
   constructor(store, { indexPath, embeddings } = {}) {
@@ -17,6 +23,10 @@ export class L2Index {
     this.indexPath = indexPath
     this.bm25 = new Bm25Index()
     this.vectors = new Map()
+    // Incremental embedding cache, keyed by content hash so it survives
+    // node id churn across rebuilds: hash -> vec, plus id -> hash for save()
+    this._hashToVec = new Map()
+    this._idToHash = new Map()
     this.loaded = false
     this.embeddingsEnabled = embeddings !== undefined
       ? embeddings
@@ -27,6 +37,7 @@ export class L2Index {
     const nodes = this.store.findNodes({ subprojectId })
     this.bm25 = new Bm25Index()
     this.vectors.clear()
+    this.lastEmbedStats = null
 
     for (const node of nodes) {
       const text = nodeToSearchText(node)
@@ -52,30 +63,71 @@ export class L2Index {
     }
 
     this.loaded = true
-    return { indexed: nodes.length, vectors: this.vectors.size }
+    return {
+      indexed: nodes.length,
+      vectors: this.vectors.size,
+      ...(this.lastEmbedStats ? { embedded: this.lastEmbedStats.embedded, reused: this.lastEmbedStats.reused } : {}),
+    }
   }
 
   async _buildVectors(nodes) {
-    const texts = []
-    const ids = []
-    for (const node of nodes.slice(0, 2000)) {
-      texts.push(nodeToSearchText(node))
-      ids.push(String(node.id))
+    const capped = EMBED_MAX_NODES > 0 ? nodes.slice(0, EMBED_MAX_NODES) : nodes
+    const entries = []
+    for (const node of capped) {
+      const text = nodeToSearchText(node)
+      entries.push({ id: String(node.id), hash: textHash(text), text })
     }
 
-    if (texts.length === 0) return
-
-    let embeddings
-    if (EMBED_API_URL && EMBED_MODEL) {
-      embeddings = await fetchEmbeddings(texts)
-    } else {
-      const { embed } = await import('./embeddings.js')
-      embeddings = await embed(texts)
+    if (entries.length === 0) {
+      this.vectors = new Map()
+      this._idToHash = new Map()
+      return
     }
 
-    for (let i = 0; i < ids.length && i < embeddings.length; i++) {
-      this.vectors.set(ids[i], embeddings[i])
+    const newVectors = new Map()
+    const newIdToHash = new Map()
+    const toEmbed = []
+    const queuedHashes = new Set()
+    let reused = 0
+
+    for (const entry of entries) {
+      newIdToHash.set(entry.id, entry.hash)
+      const cached = this._hashToVec.get(entry.hash)
+      if (cached) {
+        newVectors.set(entry.id, cached)
+        reused++
+      } else if (!queuedHashes.has(entry.hash)) {
+        queuedHashes.add(entry.hash)
+        toEmbed.push(entry)
+      }
     }
+
+    if (toEmbed.length > 0) {
+      let embedFn
+      if (EMBED_API_URL && EMBED_MODEL) {
+        embedFn = (texts) => fetchEmbeddings(texts)
+      } else {
+        const { embed } = await import('./embeddings.js')
+        embedFn = (texts) => embed(texts)
+      }
+
+      for (let i = 0; i < toEmbed.length; i += EMBED_API_BATCH) {
+        const chunk = toEmbed.slice(i, i + EMBED_API_BATCH)
+        const embeddings = await embedFn(chunk.map(e => e.text))
+        for (let j = 0; j < chunk.length && j < embeddings.length; j++) {
+          this._hashToVec.set(chunk[j].hash, embeddings[j])
+        }
+      }
+
+      for (const entry of entries) {
+        const vec = this._hashToVec.get(entry.hash)
+        if (vec) newVectors.set(entry.id, vec)
+      }
+    }
+
+    this.vectors = newVectors
+    this._idToHash = newIdToHash
+    this.lastEmbedStats = { total: entries.length, reused, embedded: toEmbed.length }
   }
 
   async search(query, opts = {}) {
@@ -147,14 +199,14 @@ export class L2Index {
     fs.mkdirSync(dir, { recursive: true });
 
     const bm25Data = this.bm25.serialize();
-    fs.writeFileSync(path.join(dir, 'bm25.json'), JSON.stringify(bm25Data, null, 2));
+    atomicWriteFileSync(path.join(dir, 'bm25.json'), JSON.stringify(bm25Data, null, 2));
 
     if (this.vectors.size > 0) {
       const vecData = [];
       for (const [id, vec] of this.vectors) {
-        vecData.push({ id, vec });
+        vecData.push({ id, hash: this._idToHash.get(id) || null, vec });
       }
-      fs.writeFileSync(path.join(dir, 'vectors.json'), JSON.stringify(vecData, null, 2));
+      atomicWriteFileSync(path.join(dir, 'vectors.json'), JSON.stringify(vecData));
     } else if (fs.existsSync(path.join(dir, 'vectors.json'))) {
       fs.unlinkSync(path.join(dir, 'vectors.json'));
     }
@@ -185,13 +237,25 @@ export class L2Index {
     if (fs.existsSync(vecFile)) {
       const vecData = JSON.parse(fs.readFileSync(vecFile, 'utf-8'));
       this.vectors.clear();
-      for (const { id, vec } of vecData) {
+      this._hashToVec.clear();
+      this._idToHash.clear();
+      for (const { id, hash, vec } of vecData) {
         this.vectors.set(id, vec);
+        if (hash) {
+          this._hashToVec.set(hash, vec);
+          this._idToHash.set(id, hash);
+        }
       }
     } else if (data.vectors) {
       this.vectors.clear();
-      for (const { id, vec } of data.vectors) {
+      this._hashToVec.clear();
+      this._idToHash.clear();
+      for (const { id, hash, vec } of data.vectors) {
         this.vectors.set(id, vec);
+        if (hash) {
+          this._hashToVec.set(hash, vec);
+          this._idToHash.set(id, hash);
+        }
       }
     }
 
@@ -202,6 +266,10 @@ export class L2Index {
   isLoaded() {
     return this.loaded
   }
+}
+
+function textHash(text) {
+  return createHash('sha1').update(text).digest('hex')
 }
 
 function nodeToSearchText(node) {
@@ -319,6 +387,10 @@ async function fetchEmbeddings(texts) {
 
   return new Promise((resolve, reject) => {
     const parsed = new URL(EMBED_API_URL)
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      reject(new Error('Embedding API URL must use http or https'))
+      return
+    }
     const mod = parsed.protocol === 'https:' ? https : http
     const reqOpts = {
       hostname: parsed.hostname,
@@ -335,9 +407,22 @@ async function fetchEmbeddings(texts) {
 
     const req = mod.request(reqOpts, (res) => {
       let data = ''
-      res.on('data', (chunk) => { data += chunk })
+      let size = 0
+      const maxResponseBytes = 16 * 1024 * 1024
+      res.on('data', (chunk) => {
+        size += chunk.length
+        if (size > maxResponseBytes) {
+          req.destroy(new Error('Embedding response exceeded 16 MiB'))
+          return
+        }
+        data += chunk
+      })
       res.on('end', () => {
         try {
+          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+            reject(new Error(`Embedding server returned HTTP ${res.statusCode || 'unknown'}`))
+            return
+          }
           const json = JSON.parse(data)
           const embeddings = (json.data || json.embeddings || [])
             .sort((a, b) => a.index - b.index)
@@ -379,5 +464,3 @@ function safeParse(json) {
     return {}
   }
 }
-
-export { Bm25Index }

@@ -41,6 +41,7 @@ export class L3InferenceEngine {
     });
 
     const parsed = new URL(this.baseUrl);
+    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('L3 base URL must use http or https');
     const isHttps = parsed.protocol === 'https:';
     const client = isHttps ? https : http;
 
@@ -48,7 +49,7 @@ export class L3InferenceEngine {
       const reqOpts = {
         hostname: parsed.hostname,
         port: parsed.port || (isHttps ? 443 : 80),
-        path: parsed.pathname + '/chat/completions',
+        path: `${parsed.pathname.replace(/\/$/, '')}/chat/completions${parsed.search}`,
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -60,9 +61,22 @@ export class L3InferenceEngine {
 
       const req = client.request(reqOpts, (res) => {
         let data = '';
-        res.on('data', (chunk) => { data += chunk; });
+        let size = 0;
+        const maxResponseBytes = 2 * 1024 * 1024;
+        res.on('data', (chunk) => {
+          size += chunk.length;
+          if (size > maxResponseBytes) {
+            req.destroy(new Error('Inference response exceeded 2 MiB'));
+            return;
+          }
+          data += chunk;
+        });
         res.on('end', () => {
           try {
+            if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+              reject(new Error(`Inference server returned HTTP ${res.statusCode || 'unknown'}`));
+              return;
+            }
             const json = JSON.parse(data);
             if (json.error) {
               reject(new Error(json.error.message || JSON.stringify(json.error)));

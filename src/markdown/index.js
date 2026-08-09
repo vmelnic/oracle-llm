@@ -229,8 +229,26 @@ export function processMarkdownFiles(subproject, store) {
   const { id: subprojectId, root } = subproject;
   const allFiles = [...findConventionFiles(root), ...findDocFiles(root)];
   const unique = [...new Set(allFiles)];
+  const presentPaths = new Set(unique.map(filePath => path.relative(root, filePath)));
   let nodesCreated = 0;
   let nodesEnriched = 0;
+
+  // Remove sections for deleted docs and rebuild documentation enrichment so
+  // renamed/removed sections cannot leave stale context on code symbols.
+  for (const node of store.findNodes({ subprojectId })) {
+    if (node.kind === 'doc_section' && !presentPaths.has(node.path)) {
+      store.deleteNode(node.id);
+      continue;
+    }
+    if (!node.metadata) continue;
+    try {
+      const metadata = JSON.parse(node.metadata);
+      if (metadata._doc_context) {
+        delete metadata._doc_context;
+        store.updateNodeMetadata(node.id, Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null);
+      }
+    } catch {}
+  }
 
   for (const filePath of unique) {
     try {
@@ -261,6 +279,7 @@ export function processMarkdownFiles(subproject, store) {
           metadata.has_code_examples = true;
           metadata.example_langs = [...new Set(section.codeBlocks.map(b => b.lang).filter(Boolean))];
         }
+        metadata._oracle_sources = ['markdown'];
 
         store.upsertNodes([{
           subprojectId,

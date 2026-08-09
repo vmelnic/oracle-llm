@@ -11,9 +11,10 @@ function _resetIdleTimer() {
     _extractor = null
     _idleTimer = null
   }, UNLOAD_TIMEOUT * 1000)
+  _idleTimer.unref?.()
 }
 
-export async function loadEmbedder(modelName) {
+async function loadEmbedder(modelName) {
   if (_extractor) {
     _resetIdleTimer()
     return _extractor
@@ -31,24 +32,29 @@ export async function loadEmbedder(modelName) {
     let mod
     try {
       mod = await import('@huggingface/transformers')
-    } catch {
-      try {
-        mod = await import('@xenova/transformers')
-      } catch {
-        throw new Error(
-          'Embeddings enabled but no transformers package found. ' +
-          'Install: npm install @huggingface/transformers'
-        )
-      }
+    } catch (error) {
+      throw new Error(
+        'Embeddings enabled but @huggingface/transformers could not be loaded. ' +
+        'Run npm install and verify the native ONNX runtime for this platform.',
+        { cause: error }
+      )
     }
 
-    _extractor = await mod.pipeline('feature-extraction', model, {
-      quantized: true,
-    })
-    _loading = null
+    try {
+      _extractor = await mod.pipeline('feature-extraction', model, {
+        dtype: 'q8',
+      })
+    } catch (error) {
+      throw new Error(`Failed to load embedding model "${model}": ${error.message}`, {
+        cause: error,
+      })
+    }
+
     _resetIdleTimer()
     return _extractor
-  })()
+  })().finally(() => {
+    _loading = null
+  })
 
   return _loading
 }
@@ -58,6 +64,8 @@ export async function embed(texts, modelName) {
   const results = []
   const BATCH = 64
 
+  // Note: measured on CPU ONNX — per-text inference beats batching here
+  // (batch padding costs more than the per-call overhead), so keep it simple.
   for (let i = 0; i < texts.length; i += BATCH) {
     const batch = texts.slice(i, i + BATCH)
     for (const text of batch) {
@@ -75,18 +83,4 @@ export async function embedSingle(text, modelName) {
   const output = await extractor(text, { pooling: 'mean', normalize: true })
   _resetIdleTimer()
   return Array.from(output.data)
-}
-
-export async function isAvailable() {
-  try {
-    await import('@huggingface/transformers')
-    return true
-  } catch {
-    try {
-      await import('@xenova/transformers')
-      return true
-    } catch {
-      return false
-    }
-  }
 }

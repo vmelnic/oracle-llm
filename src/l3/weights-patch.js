@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 
 export class WeightsThenPatch {
   constructor(store, patterns, manifest) {
@@ -99,10 +100,72 @@ export class WeightsThenPatch {
     return this.driftLog;
   }
 
+  validateSynthesis(l3Result, allowedEvidence, subprojectId) {
+    const text = l3Result?.text;
+    const evidence = l3Result?.evidence;
+    if (typeof text !== 'string' || !text.trim() || !Array.isArray(evidence) || evidence.length === 0) {
+      return { accepted: false, reason: 'L3 response has no verifiable evidence' };
+    }
+
+    const allowed = new Map();
+    const evidenceRoot = allowedEvidence?.find(item => item?.subproject_root)?.subproject_root;
+    for (const item of allowedEvidence || []) {
+      if (!item?.path || !Array.isArray(item.line_range)) continue;
+      const key = normalizeEvidencePath(item.path, item.subproject_root);
+      const ranges = allowed.get(key) || [];
+      ranges.push(item.line_range);
+      allowed.set(key, ranges);
+    }
+
+    for (const item of evidence) {
+      const key = normalizeEvidencePath(item.path, evidenceRoot);
+      const ranges = allowed.get(key);
+      const exactRange = ranges?.some(([start, end]) =>
+        item.line_range?.[0] === start && item.line_range?.[1] === end
+      );
+      if (!exactRange) {
+        return { accepted: false, reason: `L3 cited evidence outside the L1 allowlist: ${item.path}` };
+      }
+    }
+
+    const referencedPaths = text.match(/(?:[a-zA-Z0-9_.-]+\/)+[a-zA-Z0-9_.-]+\.(?:js|jsx|mjs|cjs|ts|tsx|php|dart|vue|py|go|rs|java|sql|ya?ml|json|proto|graphql)/g) || [];
+    for (const referenced of referencedPaths) {
+      if (!allowed.has(normalizeEvidencePath(referenced, evidenceRoot))) {
+        return { accepted: false, reason: `L3 referenced a path outside the L1 allowlist: ${referenced}` };
+      }
+    }
+
+    return { accepted: true };
+  }
+
+  recordDrift(subprojectId, reason) {
+    this.driftLog.push({
+      timestamp: new Date().toISOString(),
+      subprojectId,
+      reason,
+    });
+  }
+
   saveDriftLog(outputPath) {
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, JSON.stringify(this.driftLog, null, 2));
+    let existing = [];
+    try {
+      const parsed = JSON.parse(fs.readFileSync(outputPath, 'utf-8'));
+      if (Array.isArray(parsed)) existing = parsed;
+    } catch {}
+    const combined = [...existing, ...this.driftLog].slice(-1000);
+    atomicWriteFileSync(outputPath, JSON.stringify(combined, null, 2));
+    this.driftLog = [];
   }
+}
+
+function normalizeEvidencePath(filePath, root) {
+  if (!filePath) return '';
+  let normalized = String(filePath).replace(/\\/g, '/');
+  if (root && path.isAbsolute(normalized)) {
+    normalized = path.relative(root, normalized).replace(/\\/g, '/');
+  }
+  return normalized.replace(/^\.\//, '');
 }
 
 function extractClaims(answer) {

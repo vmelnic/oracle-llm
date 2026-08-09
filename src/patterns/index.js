@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import path from 'path';
 import crypto from 'crypto';
 
@@ -68,7 +69,7 @@ export class PatternCatalogue {
   save(outputPath) {
     const data = this.listPatterns();
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(outputPath, JSON.stringify(data, null, 2));
     return data.length;
   }
 

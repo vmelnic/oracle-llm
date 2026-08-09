@@ -1,9 +1,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  isInitializeRequest,
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { GraphStore } from '../graph/store.js';
@@ -42,6 +43,7 @@ import {
 
 import path from 'path';
 import fs from 'fs';
+import { randomUUID, timingSafeEqual } from 'node:crypto';
 
 const TOOL_DEFS = [
   {
@@ -309,6 +311,8 @@ const TOOL_DEFS = [
             properties: {
               path: { type: 'string' },
               content: { type: 'string' },
+              action: { type: 'string', enum: ['add', 'modify', 'delete'] },
+              deleted: { type: 'boolean' },
             },
           },
           description: 'Array of {path, content} objects representing the proposed changes',
@@ -371,7 +375,7 @@ const TOOL_HANDLERS = {
   'oracle.stats': stats,
 };
 
-const MAX_CACHE_SIZE = parseInt(process.env.ORACLE_MCP_CACHE_SIZE || '10', 10);
+const MAX_CACHE_SIZE = positiveInt(process.env.ORACLE_MCP_CACHE_SIZE, 128);
 
 class SimpleLruMap extends Map {
   constructor(maxSize, onEvict) {
@@ -406,13 +410,14 @@ class SimpleLruMap extends Map {
   }
 }
 
-function evictResources(key) {
-  const store = openStores.get(key);
+function evictResources(key, cachedStore) {
+  const store = cachedStore || Map.prototype.get.call(openStores, key);
   if (store) { try { store.close(); } catch {} }
   openPatterns.delete(key);
   loadedManifests.delete(key);
   openL2.delete(key);
   loadedL3.delete(key);
+  loadedStateVersions.delete(key);
   lastAccessed.delete(key);
   const watcher = activeWatchers.get(key);
   if (watcher) {
@@ -426,6 +431,7 @@ const openPatterns = new Map();
 const loadedManifests = new Map();
 const openL2 = new Map();
 const loadedL3 = new Map();
+const loadedStateVersions = new Map();
 const lastAccessed = new Map();
 const activeWatchers = new Map();
 let idleTimer = null;
@@ -449,7 +455,6 @@ function closeIdleResources() {
   const cutoff = Date.now() - idleTimeoutMs;
   for (const [storeKey, ts] of lastAccessed) {
     if (ts < cutoff) {
-      evictResources(storeKey);
       openStores.delete(storeKey);
     }
   }
@@ -470,13 +475,35 @@ function getContext(workspaceId, subprojectId) {
   if (!subproject) throw new Error(`Subproject '${subprojectId}' not found in workspace '${workspaceId}'`);
 
   const storeKey = `${workspaceId}/${subprojectId}`;
+  const resourceDir = getSubprojectDir(workspaceId, subprojectId);
+  if (fs.existsSync(path.join(resourceDir, '.ingest.lock'))) {
+    throw new Error(`Subproject '${storeKey}' is being reindexed; retry shortly`);
+  }
+  const ingestStatePath = path.join(resourceDir, 'ingest_state.json');
+  let ingestVersion = null;
+  if (fs.existsSync(ingestStatePath)) {
+    try {
+      const ingestState = JSON.parse(fs.readFileSync(ingestStatePath, 'utf-8'));
+      ingestVersion = ingestState.updated_at || null;
+      if (ingestState.status === 'failed' || ingestState.status === 'reset') {
+        throw new Error(`Subproject '${storeKey}' is not ready; run oracle.ingest before querying`);
+      }
+    } catch (err) {
+      if (err.message.includes('not ready')) throw err;
+      throw new Error(`Subproject '${storeKey}' has an unreadable ingest state`);
+    }
+  }
+  if (openStores.has(storeKey) && loadedStateVersions.get(storeKey) !== ingestVersion) {
+    openStores.delete(storeKey);
+  }
   touch(storeKey);
 
   if (!openStores.has(storeKey)) {
-    const dir = getSubprojectDir(workspaceId, subprojectId);
+    const dir = resourceDir;
     const dbPath = path.join(dir, 'entity_graph.sqlite');
     if (!fs.existsSync(dbPath)) throw new Error(`Entity graph not built for ${storeKey}. Run 'oracle ingest' first.`);
     openStores.set(storeKey, new GraphStore(dbPath));
+    loadedStateVersions.set(storeKey, ingestVersion);
   }
 
   if (!openPatterns.has(storeKey)) {
@@ -528,7 +555,10 @@ function getContext(workspaceId, subprojectId) {
   return {
     store: openStores.get(storeKey),
     subproject,
-    grounding: new GroundingWrapper(openStores.get(storeKey), { parser: getParser() }),
+    grounding: new GroundingWrapper(openStores.get(storeKey), {
+      parser: getParser(),
+      subprojectRoot: subproject.root,
+    }),
     workspace,
     patterns: openPatterns.get(storeKey),
     manifest: loadedManifests.get(storeKey),
@@ -575,9 +605,12 @@ function checkCrossSubproject(workspace, workspaceId, currentSubprojectId, toolA
       const dbPath = path.join(dir, 'entity_graph.sqlite');
       if (!fs.existsSync(dbPath)) continue;
       const siblingStore = new GraphStore(dbPath);
-      const found = siblingStore.locate(sp.id, searchTerm);
-      siblingStore.close();
-      if (found.length > 0) siblingIds.push(sp.id);
+      try {
+        const found = siblingStore.locate(sp.id, searchTerm);
+        if (found.length > 0) siblingIds.push(sp.id);
+      } finally {
+        siblingStore.close();
+      }
     } catch {}
   }
 
@@ -620,9 +653,12 @@ function checkCrossSubprojectHint(workspace, workspaceId, currentSubprojectId, t
       const dbPath = path.join(dir, 'entity_graph.sqlite');
       if (!fs.existsSync(dbPath)) continue;
       const siblingStore = new GraphStore(dbPath);
-      const found = siblingStore.locate(sp.id, searchTerm);
-      siblingStore.close();
-      if (found.length > 0) siblingIds.push(sp.id);
+      try {
+        const found = siblingStore.locate(sp.id, searchTerm);
+        if (found.length > 0) siblingIds.push(sp.id);
+      } finally {
+        siblingStore.close();
+      }
     } catch {}
   }
 
@@ -669,14 +705,14 @@ const FACTUAL_TOOLS = new Set([
   'oracle.consumers', 'oracle.impact', 'oracle.validate',
 ]);
 
-export async function createMcpServer() {
+export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } = {}) {
   const server = new Server(
     { name: 'llm-oracle', version: '0.1.0' },
     { capabilities: { tools: {} } }
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: TOOL_DEFS,
+    tools: allowAdmin ? TOOL_DEFS : TOOL_DEFS.filter(tool => !ADMIN_HANDLERS[tool.name]),
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
@@ -684,21 +720,44 @@ export async function createMcpServer() {
 
     const adminHandler = ADMIN_HANDLERS[name];
     if (adminHandler) {
+      if (!allowAdmin) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify(toolErrorEnvelope('Administrative tools are disabled for this transport')) }],
+          isError: true,
+        };
+      }
       try {
+        if (allowedRoots.length > 0 && args?.workspace_id) {
+          const requestedWorkspace = loadWorkspace(args.workspace_id);
+          if (requestedWorkspace && !isRootAllowed(requestedWorkspace.root, allowedRoots)) {
+            throw new Error(`Workspace '${args.workspace_id}' is outside ORACLE_ALLOWED_ROOTS`);
+          }
+        }
         const adminCtx = {
+          allowedRoots,
+          isRootAllowed(root) {
+            return allowedRoots.length === 0 || isRootAllowed(root, allowedRoots);
+          },
           evict(workspaceId, subprojectId) {
             const storeKey = `${workspaceId}/${subprojectId}`;
-            evictResources(storeKey);
             openStores.delete(storeKey);
           },
         };
         const result = await adminHandler(adminCtx, args || {});
+        const normalized = result?.answer !== undefined && Array.isArray(result?.evidence)
+          ? result
+          : {
+              answer: result,
+              evidence: [],
+              confidence: result?.error ? 0 : 1,
+              layer: 'L1',
+            };
         const outputFormat = process.env.ORACLE_OUTPUT_FORMAT || 'toon';
-        const text = outputFormat === 'toon' ? toToon(result) : JSON.stringify(result, null, 2);
-        return { content: [{ type: 'text', text }] };
+        const text = outputFormat === 'toon' ? toToon(normalized) : JSON.stringify(normalized, null, 2);
+        return { content: [{ type: 'text', text }], ...(result?.error ? { isError: true } : {}) };
       } catch (err) {
         return {
-          content: [{ type: 'text', text: JSON.stringify({ error: err.message }) }],
+          content: [{ type: 'text', text: JSON.stringify(toolErrorEnvelope(err.message)) }],
           isError: true,
         };
       }
@@ -706,7 +765,10 @@ export async function createMcpServer() {
 
     const handler = TOOL_HANDLERS[name];
     if (!handler) {
-      return { content: [{ type: 'text', text: JSON.stringify({ error: `Unknown tool: ${name}` }) }] };
+      return {
+        content: [{ type: 'text', text: JSON.stringify(toolErrorEnvelope(`Unknown tool: ${name}`)) }],
+        isError: true,
+      };
     }
 
     try {
@@ -737,26 +799,28 @@ export async function createMcpServer() {
       ]);
       if (OPEN_ENDED_TOOLS.has(name) && ctx.l3?.isAvailable()) {
         try {
-          const l1Context = buildL1Context(enriched, ctx);
+          const verifiedL1Evidence = (enriched.evidence || []).filter(item => ctx.grounding.verifyEvidence(item));
+          if (verifiedL1Evidence.length === 0) throw new Error('No verified L1 evidence available for L3 synthesis');
+          const l1Context = buildL1Context({ ...enriched, evidence: verifiedL1Evidence }, ctx);
           const l3Result = await ctx.l3.query(JSON.stringify(toolArgs), { maxTokens: 512, l1Context });
-          const patched = ctx.weightsPatch.validate({
-            answer: { text: l3Result.text },
-            evidence: l3Result.evidence,
-            confidence: 0.75,
-            layer: 'L3',
-          }, subproject_id);
+          const synthesisValidation = ctx.weightsPatch.validateSynthesis(
+            l3Result,
+            verifiedL1Evidence,
+            subproject_id,
+          );
 
-          if (patched._patches === 0 && l3Result.evidence.length > 0) {
+          if (synthesisValidation.accepted) {
             enriched = {
               ...enriched,
               answer: enriched.answer,
               _l3_synthesis: l3Result.text,
-              evidence: [...(enriched.evidence || []), ...l3Result.evidence],
+              evidence: verifiedL1Evidence,
               layer: 'L3',
             };
           }
 
-          if (patched._patches > 0) {
+          if (!synthesisValidation.accepted) {
+            ctx.weightsPatch.recordDrift(subproject_id, synthesisValidation.reason);
             const dir = getSubprojectDir(workspace_id, subproject_id);
             const driftPath = path.join(dir, 'drift_log.json');
             try { ctx.weightsPatch.saveDriftLog(driftPath); } catch {}
@@ -805,7 +869,7 @@ export async function createMcpServer() {
       return {
         content: [{
           type: 'text',
-          text: JSON.stringify({ error: err.message, layer: 'L1', evidence: [], confidence: 0 }),
+          text: JSON.stringify(toolErrorEnvelope(err.message)),
         }],
         isError: true,
       };
@@ -815,64 +879,156 @@ export async function createMcpServer() {
   return server;
 }
 
+function toolErrorEnvelope(message) {
+  return { answer: { error: message }, evidence: [], confidence: 0, layer: 'L1' };
+}
+
 export async function startMcpServer(opts = {}) {
-  const { transport: transportType = 'stdio', port = 3000, idleTimeoutMinutes = 0, watch = false } = opts;
+  const {
+    transport: requestedTransport = 'stdio',
+    port = 3000,
+    host = process.env.ORACLE_MCP_HOST || '127.0.0.1',
+    idleTimeoutMinutes = 0,
+    watch = false,
+  } = opts;
+  const transportType = requestedTransport === 'sse' ? 'http' : requestedTransport;
+  if (!['stdio', 'http'].includes(transportType)) {
+    throw new Error(`Unsupported transport '${requestedTransport}'. Use 'stdio' or 'http'.`);
+  }
   idleTimeoutMs = idleTimeoutMinutes > 0 ? idleTimeoutMinutes * 60_000 : 0;
   watchEnabled = watch;
   startIdleTimer();
 
-  const server = await createMcpServer();
-
-  if (transportType === 'sse') {
+  if (transportType === 'http') {
     const http = await import('node:http');
     const { URL } = await import('node:url');
 
-    let activeTransport = null;
+    const authToken = process.env.ORACLE_MCP_AUTH_TOKEN || '';
+    const loopback = isLoopbackHost(host);
+    if (authToken && Buffer.byteLength(authToken) < 32) {
+      throw new Error('ORACLE_MCP_AUTH_TOKEN must contain at least 32 bytes');
+    }
+    if (!loopback && !authToken) {
+      throw new Error('ORACLE_MCP_AUTH_TOKEN is required when binding MCP HTTP to a non-loopback host');
+    }
 
-    return new Promise((resolve) => {
+    const allowAdmin = process.env.ORACLE_MCP_ADMIN_ENABLED === 'true';
+    const allowedRoots = parseAllowedRoots(process.env.ORACLE_ALLOWED_ROOTS || '');
+    if (allowAdmin && allowedRoots.length === 0) {
+      throw new Error('ORACLE_ALLOWED_ROOTS is required when HTTP administrative tools are enabled');
+    }
+
+    const maxBodyBytes = positiveInt(process.env.ORACLE_MCP_MAX_BODY_BYTES, 1_048_576);
+    const rateLimit = positiveInt(process.env.ORACLE_MCP_RATE_LIMIT_PER_MINUTE, 120);
+    const maxSessions = positiveInt(process.env.ORACLE_MCP_MAX_SESSIONS, 100);
+    const sessionIdleMs = positiveInt(process.env.ORACLE_MCP_SESSION_IDLE_MINUTES, 30) * 60_000;
+    const allowedHosts = new Set(parseCsv(process.env.ORACLE_MCP_ALLOWED_HOSTS || ''));
+    const allowedOrigins = new Set(parseCsv(process.env.ORACLE_MCP_ALLOWED_ORIGINS || ''));
+    if (!loopback && allowedHosts.size === 0) {
+      throw new Error('ORACLE_MCP_ALLOWED_HOSTS is required when binding MCP HTTP to a non-loopback host');
+    }
+    if (allowedHosts.size === 0 && loopback) {
+      for (const value of [`localhost:${port}`, `127.0.0.1:${port}`, `[::1]:${port}`]) allowedHosts.add(value);
+    }
+    const urlHost = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+
+    const transports = new Map();
+    const sessionServers = new Map();
+    const sessionLastAccess = new Map();
+    const clients = new Map();
+    const sessionTimer = setInterval(async () => {
+      const cutoff = Date.now() - sessionIdleMs;
+      for (const [sid, timestamp] of sessionLastAccess) {
+        if (timestamp >= cutoff) continue;
+        sessionLastAccess.delete(sid);
+        const transport = transports.get(sid);
+        if (transport) try { await transport.close(); } catch {}
+      }
+    }, 60_000);
+    sessionTimer.unref?.();
+
+    return new Promise((resolve, reject) => {
       const httpServer = http.createServer(async (req, res) => {
-        const parsed = new URL(req.url || '/', `http://localhost:${port}`);
-
-        if (parsed.pathname === '/sse') {
-          res.setHeader('Content-Type', 'text/event-stream');
-          res.setHeader('Cache-Control', 'no-cache');
-          res.setHeader('Connection', 'keep-alive');
-          res.flushHeaders();
-
-          const transport = new SSEServerTransport('/message', res);
-          activeTransport = transport;
-          await server.connect(transport);
-        } else if (parsed.pathname === '/message' && req.method === 'POST') {
-          if (activeTransport) {
-            let body = '';
-            req.on('data', (chunk) => { body += chunk });
-            req.on('end', () => {
-              try {
-                const message = JSON.parse(body);
-                activeTransport.handlePostMessage(message, res);
-              } catch {
-                res.writeHead(400);
-                res.end('Bad request');
-              }
-            });
-          } else {
-            res.writeHead(503);
-            res.end('No active SSE connection');
+        setSecurityHeaders(res);
+        try {
+          const parsed = new URL(req.url || '/', `http://${urlHost}:${port}`);
+          if (parsed.pathname === '/healthz' || parsed.pathname === '/readyz') {
+            return sendJson(res, 200, { status: 'ok' });
           }
-        } else {
-          res.writeHead(200);
-          res.end('llm-oracle MCP server (SSE)');
+          if (parsed.pathname !== '/mcp') return sendJson(res, 404, { error: 'not found' });
+          if (!isHostAllowed(req.headers.host, allowedHosts) || !isOriginAllowed(req.headers.origin, allowedOrigins)) {
+            return sendJson(res, 403, { error: 'forbidden host or origin' });
+          }
+          if (!authenticateRequest(req, authToken)) return sendJson(res, 401, { error: 'unauthorized' });
+          if (!consumeRateLimit(clients, req.socket.remoteAddress || 'unknown', rateLimit)) {
+            res.setHeader('Retry-After', '60');
+            return sendJson(res, 429, { error: 'rate limit exceeded' });
+          }
+
+          const sessionId = req.headers['mcp-session-id'];
+          let transport = typeof sessionId === 'string' ? transports.get(sessionId) : null;
+          if (transport) sessionLastAccess.set(sessionId, Date.now());
+          let body;
+
+          if (req.method === 'POST') {
+            body = await readJsonBody(req, maxBodyBytes);
+            if (!transport && !sessionId && isInitializeRequest(body)) {
+              if (transports.size >= maxSessions) return sendJson(res, 503, jsonRpcError('MCP session limit reached'));
+              let sessionServer;
+              let createdTransport;
+              createdTransport = new StreamableHTTPServerTransport({
+                sessionIdGenerator: () => randomUUID(),
+                onsessioninitialized: (sid) => {
+                  transports.set(sid, createdTransport);
+                  sessionServers.set(sid, sessionServer);
+                  sessionLastAccess.set(sid, Date.now());
+                },
+              });
+              sessionServer = await createMcpServer({ allowAdmin, allowedRoots });
+              createdTransport.onclose = async () => {
+                const sid = createdTransport.sessionId;
+                if (sid) transports.delete(sid);
+                if (sid) sessionServers.delete(sid);
+                if (sid) sessionLastAccess.delete(sid);
+                try { await sessionServer.close(); } catch {}
+              };
+              await sessionServer.connect(createdTransport);
+              transport = createdTransport;
+            }
+          }
+
+          if (!transport) return sendJson(res, 400, jsonRpcError('No valid MCP session'));
+          await transport.handleRequest(req, res, body);
+        } catch (err) {
+          const status = err?.statusCode || 500;
+          if (!res.headersSent) sendJson(res, status, jsonRpcError(status === 500 ? 'Internal server error' : err.message));
+          else if (!res.writableEnded) res.end();
         }
       });
 
-      httpServer.listen(port, () => {
-        console.error(`MCP server listening on http://localhost:${port}/sse`);
-        setupGracefulShutdown({ server, httpServer });
-        resolve({ server, httpServer });
+      httpServer.maxHeadersCount = 100;
+      httpServer.maxConnections = positiveInt(process.env.ORACLE_MCP_MAX_CONNECTIONS, 200);
+      httpServer.headersTimeout = positiveInt(process.env.ORACLE_MCP_HEADERS_TIMEOUT_MS, 10_000);
+      httpServer.requestTimeout = positiveInt(process.env.ORACLE_MCP_REQUEST_TIMEOUT_MS, 120_000);
+      httpServer.keepAliveTimeout = positiveInt(process.env.ORACLE_MCP_KEEPALIVE_TIMEOUT_MS, 5_000);
+      httpServer.on('clientError', (_err, socket) => socket.end('HTTP/1.1 400 Bad Request\r\n\r\n'));
+      let listening = false;
+      httpServer.on('error', err => {
+        clearInterval(sessionTimer);
+        if (!listening) reject(err);
+        else console.error(`[oracle] MCP HTTP server error: ${err.message}`);
+      });
+
+      httpServer.listen(port, host, () => {
+        listening = true;
+        console.error(`MCP server listening on http://${urlHost}:${port}/mcp`);
+        setupGracefulShutdown({ httpServer, transports, sessionServers, timers: [sessionTimer] });
+        resolve({ httpServer, transports });
       });
     });
   }
 
+  const server = await createMcpServer({ allowAdmin: true });
   const transport = new StdioServerTransport();
   await server.connect(transport);
 
@@ -881,7 +1037,7 @@ export async function startMcpServer(opts = {}) {
   return { server };
 }
 
-function setupGracefulShutdown({ server, httpServer }) {
+function setupGracefulShutdown({ server, httpServer, transports = new Map(), sessionServers = new Map(), timers = [] }) {
   let shuttingDown = false;
 
   const shutdown = async (signal) => {
@@ -890,25 +1046,164 @@ function setupGracefulShutdown({ server, httpServer }) {
     console.error(`[oracle] ${signal} received, shutting down...`);
 
     if (idleTimer) clearInterval(idleTimer);
+    for (const timer of timers) clearInterval(timer);
 
     for (const [key, watcher] of activeWatchers) {
       try { watcher.stop(); } catch {}
       activeWatchers.delete(key);
     }
 
-    for (const [key] of openStores) {
-      evictResources(key);
+    for (const [key] of [...openStores]) openStores.delete(key);
+
+    for (const transport of transports.values()) {
+      try { await transport.close(); } catch {}
     }
+    for (const sessionServer of sessionServers.values()) {
+      if (sessionServer) try { await sessionServer.close(); } catch {}
+    }
+    if (server) try { await server.close(); } catch {}
 
     if (httpServer) {
-      httpServer.close();
+      await Promise.race([
+        new Promise(resolve => httpServer.close(resolve)),
+        new Promise(resolve => setTimeout(resolve, 5_000)),
+      ]);
+      if (typeof httpServer.closeAllConnections === 'function') httpServer.closeAllConnections();
     }
-
-    try { await server.close(); } catch {}
 
     process.exit(0);
   };
 
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+}
+
+function parseCsv(value) {
+  return value.split(',').map(v => v.trim()).filter(Boolean);
+}
+
+function parseAllowedRoots(value) {
+  return parseCsv(value).map(root => {
+    const resolved = path.resolve(root);
+    let canonical;
+    try { canonical = fs.realpathSync(resolved); }
+    catch { throw new Error(`Allowed root does not exist: ${resolved}`); }
+    if (!fs.statSync(canonical).isDirectory()) throw new Error(`Allowed root is not a directory: ${resolved}`);
+    return canonical;
+  });
+}
+
+function isRootAllowed(root, allowedRoots) {
+  let canonical;
+  try { canonical = fs.realpathSync(path.resolve(root)); } catch { return false; }
+  return allowedRoots.some(base => {
+    const relative = path.relative(base, canonical);
+    return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+  });
+}
+
+function positiveInt(value, fallback) {
+  const parsed = Number.parseInt(value || '', 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function isLoopbackHost(host) {
+  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+}
+
+function isHostAllowed(host, allowed) {
+  return allowed.size === 0 || (typeof host === 'string' && allowed.has(host));
+}
+
+function isOriginAllowed(origin, allowed) {
+  return !origin || (allowed.size > 0 && allowed.has(origin));
+}
+
+function authenticateRequest(req, expectedToken) {
+  if (!expectedToken) return true;
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) return false;
+  const received = Buffer.from(header.slice(7));
+  const expected = Buffer.from(expectedToken);
+  return received.length === expected.length && timingSafeEqual(received, expected);
+}
+
+function consumeRateLimit(clients, key, limit) {
+  const now = Date.now();
+  if (clients.size > 10_000) {
+    for (const [clientKey, value] of clients) {
+      if (now - value.startedAt >= 60_000) clients.delete(clientKey);
+    }
+    if (clients.size > 10_000 && !clients.has(key)) return false;
+  }
+  const entry = clients.get(key);
+  if (!entry || now - entry.startedAt >= 60_000) {
+    clients.set(key, { startedAt: now, count: 1 });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= limit;
+}
+
+function readJsonBody(req, maxBytes) {
+  return new Promise((resolve, reject) => {
+    const declaredLength = Number.parseInt(req.headers['content-length'] || '', 10);
+    if (Number.isSafeInteger(declaredLength) && declaredLength > maxBytes) {
+      req.resume();
+      const err = new Error('request body too large');
+      err.statusCode = 413;
+      reject(err);
+      return;
+    }
+
+    let size = 0;
+    const chunks = [];
+    let settled = false;
+    req.on('data', chunk => {
+      if (settled) return;
+      size += chunk.length;
+      if (size > maxBytes) {
+        settled = true;
+        chunks.length = 0;
+        const err = new Error('request body too large');
+        err.statusCode = 413;
+        reject(err);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+      catch {
+        const err = new Error('invalid JSON body');
+        err.statusCode = 400;
+        reject(err);
+      }
+    });
+    req.on('error', err => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
+  });
+}
+
+function setSecurityHeaders(res) {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Cache-Control', 'no-store');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', "default-src 'none'");
+}
+
+function sendJson(res, status, value) {
+  if (res.writableEnded) return;
+  const body = JSON.stringify(value);
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': Buffer.byteLength(body) });
+  res.end(body);
+}
+
+function jsonRpcError(message) {
+  return { jsonrpc: '2.0', error: { code: -32000, message }, id: null };
 }

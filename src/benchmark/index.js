@@ -62,7 +62,7 @@ export class BenchmarkRunner {
     this.ctx = {
       store,
       subproject: this.subproject,
-      grounding: new GroundingWrapper(store, { parser }),
+      grounding: new GroundingWrapper(store, { parser, subprojectRoot: this.subproject.root }),
       workspace: this.workspace,
       patterns: catalogue,
       manifest,
@@ -113,8 +113,11 @@ export class BenchmarkRunner {
       entry.layer = grounded.layer || 'L1';
 
       const evidence = grounded.evidence || [];
-      entry.evidenceCount = evidence.length;
-      entry.evidenceVerified = evidence.filter(e => !e._failed).length;
+      const unverifiedCount = grounded.unverified_evidence?.length
+        || grounded._unverified_evidence_count
+        || 0;
+      entry.evidenceCount = evidence.length + unverifiedCount;
+      entry.evidenceVerified = evidence.length;
 
       const seenFiles = new Set();
       let baselineTokens = 0;

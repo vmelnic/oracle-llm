@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import path from 'path';
 
 import { OpenApiDetector } from './detectors/openapi.js';
@@ -18,6 +19,7 @@ export class ContractRegistry {
   constructor(store) {
     this.store = store;
     this.detectors = [];
+    this.scanHadErrors = false;
   }
 
   registerDetector(detector) {
@@ -26,34 +28,88 @@ export class ContractRegistry {
 
   async scan(subproject) {
     const surfaces = [];
+    this.scanHadErrors = false;
     for (const detector of this.detectors) {
       try {
         const found = await detector.detect(subproject);
         surfaces.push(...found);
       } catch {
+        this.scanHadErrors = true;
         // detector failed for this subproject — skip
       }
     }
     return surfaces;
   }
 
-  async index(subproject) {
-    const surfaces = await this.scan(subproject);
+  async index(subproject, { previousSurfaces = [] } = {}) {
+    const detectedSurfaces = await this.scan(subproject);
+    const surfaces = this.scanHadErrors
+      ? mergeSurfaces(previousSurfaces, detectedSurfaces)
+      : detectedSurfaces;
+    if (!this.scanHadErrors) {
+      this._removeStaleSurfaces(subproject.id, previousSurfaces, surfaces);
+    }
+
     for (const surface of surfaces) {
+      const startLine = surface.startLine ?? surface.start_line ?? 0;
+      const endLine = surface.endLine ?? surface.end_line ?? 0;
+      const existing = this.store.getNodesByFile?.(subproject.id, surface.path)
+        ?.find(node => node.symbol === surface.symbol && node.kind === surface.kind && node.start_line === startLine);
+      const existingMetadata = parseMetadata(existing?.metadata);
+      const sources = new Set(existingMetadata._oracle_sources || []);
+      sources.add('contract');
+      const hasNonContractSource = [...sources].some(source => source !== 'contract');
+      const metadata = {
+        ...(hasNonContractSource ? existingMetadata : (surface.metadata || {})),
+        _oracle_sources: [...sources],
+        _contract: surface.metadata || {},
+      };
+
+      if (existing && hasNonContractSource) {
+        this.store.updateNodeMetadata(existing.id, JSON.stringify(metadata));
+        continue;
+      }
+
       this.store.upsertNode({
         subproject_id: subproject.id,
         path: surface.path,
         lang: surface.lang || subproject.language,
         symbol: surface.symbol,
         kind: surface.kind,
-        start_line: surface.startLine || 0,
-        end_line: surface.endLine || 0,
+        start_line: startLine,
+        end_line: endLine,
         exported: 1,
         signature: surface.signature || null,
-        metadata: surface.metadata || {},
+        metadata,
       });
     }
-    return { surfacesIndexed: surfaces.length, surfaces };
+    return { surfacesIndexed: surfaces.length, surfaces, scanIncomplete: this.scanHadErrors };
+  }
+
+  _removeStaleSurfaces(subprojectId, previousSurfaces, currentSurfaces) {
+    if (!Array.isArray(previousSurfaces) || previousSurfaces.length === 0) return;
+    if (!this.store.getNodesByFile || !this.store.deleteNode || !this.store.updateNodeMetadata) return;
+
+    const currentKeys = new Set(currentSurfaces.map(surface => surfaceKey(surface)));
+    for (const previous of previousSurfaces) {
+      if (currentKeys.has(surfaceKey(previous))) continue;
+      const startLine = previous.startLine ?? previous.start_line ?? 0;
+      const node = this.store.getNodesByFile(subprojectId, previous.path)
+        .find(candidate => candidate.symbol === previous.symbol
+          && candidate.kind === previous.kind
+          && candidate.start_line === startLine);
+      if (!node) continue;
+
+      const metadata = parseMetadata(node.metadata);
+      const remainingSources = (metadata._oracle_sources || []).filter(source => source !== 'contract');
+      if (remainingSources.length > 0) {
+        metadata._oracle_sources = remainingSources;
+        delete metadata._contract;
+        this.store.updateNodeMetadata(node.id, JSON.stringify(metadata));
+      } else {
+        this.store.deleteNode(node.id);
+      }
+    }
   }
 
   saveSurfacesJson(surfaces, outputPath) {
@@ -62,13 +118,13 @@ export class ContractRegistry {
       kind: s.kind,
       path: s.path,
       lang: s.lang,
-      start_line: s.startLine || 0,
-      end_line: s.endLine || 0,
+      start_line: s.startLine ?? s.start_line ?? 0,
+      end_line: s.endLine ?? s.end_line ?? 0,
       signature: s.signature || null,
       metadata: s.metadata || {},
     }));
     fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-    fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
+    atomicWriteFileSync(outputPath, JSON.stringify(data, null, 2));
     return data.length;
   }
 
@@ -121,4 +177,20 @@ export function createContractRegistry(store) {
   registry.registerDetector(new DoctrineMigrationDetector());
   registry.registerDetector(new EventBusDetector());
   return registry;
+}
+
+function surfaceKey(surface) {
+  return [surface.path, surface.symbol, surface.kind, surface.startLine ?? surface.start_line ?? 0].join('\0');
+}
+
+function parseMetadata(metadata) {
+  if (!metadata) return {};
+  if (typeof metadata === 'object') return { ...metadata };
+  try { return JSON.parse(metadata); } catch { return {}; }
+}
+
+function mergeSurfaces(previous, detected) {
+  const merged = new Map();
+  for (const surface of [...(previous || []), ...detected]) merged.set(surfaceKey(surface), surface);
+  return [...merged.values()];
 }

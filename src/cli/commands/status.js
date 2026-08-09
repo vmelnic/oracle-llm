@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import { loadWorkspace, listWorkspaces, getSubprojectDir } from '../../scanner/workspace.js';
 import { GraphStore } from '../../graph/store.js';
+import { readIngestState } from '../../ingest/state.js';
 
 export function statusCommand() {
   const cmd = new Command('status');
@@ -32,9 +33,12 @@ export function statusCommand() {
           const hasManifest = fs.existsSync(path.join(dir, 'manifest.yaml'));
           const hasL2 = fs.existsSync(path.join(dir, 'ast_embed_index.json'))
             || fs.existsSync(path.join(dir, 'ast_embed_index', 'bm25.json'));
+          const ingestState = readIngestState(dir);
+          const ingesting = fs.existsSync(path.join(dir, '.ingest.lock'))
+            || ingestState?.status === 'building';
           let nodeCount = '-';
           let edgeCount = '-';
-          if (hasGraph) {
+          if (hasGraph && !ingesting) {
             try {
               const store = new GraphStore(path.join(dir, 'entity_graph.sqlite'));
               const s = store.stats(sp.id);
@@ -53,6 +57,7 @@ export function statusCommand() {
           console.log(`  ${sp.id}`);
           console.log(`    framework: ${sp.framework || 'unknown'} | lang: ${sp.language}`);
           console.log(`    layers: ${layers.length > 0 ? layers.join(', ') : 'none (run ingest)'}`);
+          console.log(`    ingest: ${ingesting ? 'building' : (ingestState?.status || (hasGraph ? 'legacy/unknown' : 'not-run'))}`);
           console.log(`    nodes: ${nodeCount} | edges: ${edgeCount}`);
         }
       }
