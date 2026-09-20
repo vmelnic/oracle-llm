@@ -47,14 +47,14 @@
     "check": "npm test && npm run check:dead-code && npm audit --omit=dev --audit-level=high"
   },
   "dependencies": {
-    "@huggingface/transformers": "^4.2.0",
+    "@huggingface/transformers": "^4.3.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@sengac/tree-sitter-dart": "^1.1.6",
-    "better-sqlite3": "^12.11.1",
-    "commander": "^14.0.3",
+    "better-sqlite3": "^13.0.3",
+    "commander": "^15.0.0",
     "dotenv": "^17.4.2",
     "fast-glob": "^3.3.3",
-    "js-yaml": "^4.3.1",
+    "js-yaml": "^5.4.2",
     "tree-sitter": "^0.25.1",
     "tree-sitter-go": "^0.25.0",
     "tree-sitter-java": "^0.23.5",
