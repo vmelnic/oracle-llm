@@ -450,8 +450,15 @@ function extractFirstSymbol(answerObj) {
 }
 
 function sourceName(symbol) {
-  const segments = String(symbol).split(/\\|::|\./).filter(Boolean);
-  return segments[segments.length - 1] || String(symbol);
+  const text = String(symbol);
+  // Routes (`GET /courses/{id}/active`) appear by their last literal path
+  // segment, possibly under a group prefix; `/` alone has nothing to check.
+  const route = text.match(/^(?:API\s+)?[A-Z]+(?:\|[A-Z]+)*\s+(\/\S*)$/);
+  if (route) return route[1].split('/').filter(seg => seg && !/^[{:<[]/.test(seg)).pop() ?? '';
+  // Contract ids (`migration:<file>:<table>`, `kafka:<topic>`) end with the
+  // name the source spells out.
+  const segments = text.split(/\\|::|\.|(?<!:):(?!:)/).filter(Boolean);
+  return segments[segments.length - 1] || text;
 }
 
 // The synthesis travels with its untrusted-content note, never without it.

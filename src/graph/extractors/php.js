@@ -1417,16 +1417,139 @@ function extractTopLevelExpressions(node, namespace, filePath, subprojectId, use
   });
 }
 
+const ROUTE_FUNCTION_TYPES = new Set(['anonymous_function', 'anonymous_function_creation_expression', 'arrow_function']);
+
+/**
+ * What enclosing route groups and the route's own chain add to a Laravel
+ * route: `Route::prefix('user')->middleware([...])->group(fn)`,
+ * `Route::group(['prefix' => .., 'middleware' => ..], fn)` and
+ * `Route::get(..)->middleware(..)->name(..)`. Outer groups come first.
+ */
+function laravelRouteContext(node, useMap, namespace) {
+  const prefixes = [];
+  const middleware = [];
+  const names = [];
+  const apply = (calls) => {
+    for (const { method, args } of calls) {
+      if (method === 'prefix') prefixes.push(phpStringValue(args[0]) ?? '');
+      else if (method === 'middleware') middleware.push(...args.flatMap(a => middlewareValues(a, useMap, namespace)));
+      else if (method === 'withoutMiddleware') {
+        const removed = new Set(args.flatMap(a => middlewareValues(a, useMap, namespace)));
+        for (let i = middleware.length - 1; i >= 0; i--) if (removed.has(middleware[i])) middleware.splice(i, 1);
+      }
+      else if (method === 'name' || method === 'as') names.push(phpStringValue(args[0]) ?? '');
+    }
+  };
+
+  const groups = [];
+  for (let n = node.parent; n; n = n.parent) {
+    if (!ROUTE_FUNCTION_TYPES.has(n.type) || n.parent?.type !== 'argument') continue;
+    const call = n.parent.parent?.parent;
+    if (!call) continue;
+    if (call.type === 'member_call_expression' && callName(call) === 'group') {
+      groups.unshift(chainCalls(call.namedChildren[0]));
+    } else if (call.type === 'scoped_call_expression' && callName(call) === 'group') {
+      const options = callArgs(call)[0]?.namedChildren.find(c => c.type === 'array_creation_expression');
+      const calls = [];
+      for (const el of options?.namedChildren.filter(c => c.type === 'array_element_initializer') || []) {
+        const [key, value] = el.namedChildren;
+        const k = key && phpStringValue(key);
+        if (k && value) calls.push({ method: k, args: [value] });
+      }
+      groups.unshift(calls);
+    }
+  }
+  for (const calls of groups) apply(calls);
+
+  // The route's own chain: Route::get(...)->middleware(...)->name(...).
+  const own = [];
+  for (let cur = node; cur.parent?.type === 'member_call_expression' && sameNode(cur.parent.namedChildren[0], cur); cur = cur.parent) {
+    own.push({ method: callName(cur.parent), args: callArgs(cur.parent) });
+  }
+  const groupNames = names.length;
+  apply(own);
+
+  // Group `as` prefixes only make a name together with the route's own name.
+  const name = names.length > groupNames ? names.join('') : '';
+  return { prefixes, middleware: [...new Set(middleware.filter(Boolean))], name };
+}
+
+// Calls of a chain, innermost (Route::prefix) first.
+function chainCalls(expr) {
+  const calls = [];
+  for (let cur = expr; cur; cur = cur.namedChildren[0]) {
+    if (cur.type === 'member_call_expression') calls.unshift({ method: callName(cur), args: callArgs(cur) });
+    else if (cur.type === 'scoped_call_expression') {
+      calls.unshift({ method: callName(cur), args: callArgs(cur) });
+      break;
+    } else break;
+  }
+  return calls;
+}
+
+function callName(call) {
+  const names = call.namedChildren.filter(c => c.type === 'name');
+  return names[names.length - 1]?.text ?? null;
+}
+
+function callArgs(call) {
+  return call.namedChildren.find(c => c.type === 'arguments')?.namedChildren.filter(c => c.type === 'argument') ?? [];
+}
+
+function sameNode(a, b) {
+  return a && b && a.startIndex === b.startIndex && a.endIndex === b.endIndex && a.type === b.type;
+}
+
+// Literal text of a string argument/expression; null when it is not a literal.
+function phpStringValue(node) {
+  if (!node) return null;
+  const str = node.type === 'string' || node.type === 'encapsed_string' ? node : node.namedChildren?.find(c => c.type === 'string' || c.type === 'encapsed_string');
+  if (!str) return null;
+  return str.namedChildren.filter(c => c.type === 'string_content' || c.type === 'string_value').map(c => c.text).join('');
+}
+
+// 'auth:sanctum', CheckUserStatus::class, ['a', 'b'], 'role:' . Role::ADMIN -> names.
+function middlewareValues(node, useMap, namespace) {
+  if (!node) return [];
+  const value = node.type === 'argument' ? node.namedChildren[0] : node;
+  if (!value) return [];
+  if (value.type === 'array_creation_expression') {
+    return value.namedChildren.filter(c => c.type === 'array_element_initializer').flatMap(el => middlewareValues(el.namedChildren[el.namedChildren.length - 1], useMap, namespace));
+  }
+  if (value.type === 'class_constant_access_expression') {
+    const cls = value.namedChildren.find(c => c.type === 'name' || c.type === 'qualified_name');
+    return cls ? [resolveType(cls.text, useMap, namespace).split('\\').pop()] : [];
+  }
+  if (value.type === 'binary_expression') {
+    const literal = phpStringValue(value.namedChildren[0]);
+    return literal ? [literal.replace(/[:,]$/, '')] : [];
+  }
+  const literal = phpStringValue(value);
+  return literal ? [literal] : [];
+}
+
+function joinRoutePath(parts) {
+  const segments = parts.flatMap(p => String(p).split('/')).filter(Boolean);
+  return `/${segments.join('/')}`;
+}
+
 function extractLaravelRoute(node, method, filePath, subprojectId, useMap, namespace, nodes, _edges) {
   const argsNode = node.namedChildren.find(n => n.type === 'arguments');
   if (!argsNode) return;
 
-  const args = argsNode.namedChildren.filter(n => n.type === 'argument');
+  let args = argsNode.namedChildren.filter(n => n.type === 'argument');
+  // Route::match(['get', 'post'], 'path', ...): the verbs come first.
+  let verbs = method.toUpperCase();
+  if (method === 'match') {
+    const list = middlewareValues(args[0], useMap, namespace).map(v => v.toUpperCase());
+    if (list.length > 0) verbs = list.join('|');
+    args = args.slice(1);
+  }
   if (args.length < 1) return;
 
-  const pathStr = args[0].namedChildren.find(n => n.type === 'string');
-  const pathContent = pathStr?.namedChildren?.find(n => n.type === 'string_content');
-  const routePath = pathContent?.text ?? '';
+  const group = laravelRouteContext(node, useMap, namespace);
+  const ownPath = phpStringValue(args[0]) ?? '';
+  const routePath = joinRoutePath([...group.prefixes, ownPath]);
 
   let controller = null;
   let action = null;
@@ -1447,7 +1570,7 @@ function extractLaravelRoute(node, method, filePath, subprojectId, useMap, names
     }
   }
 
-  const httpMethod = method.toUpperCase();
+  const httpMethod = verbs;
   const symbol = `${httpMethod} ${routePath}`;
   const isApiRoute = routePath.startsWith('/api') || routePath.startsWith('api');
 
@@ -1457,6 +1580,8 @@ function extractLaravelRoute(node, method, filePath, subprojectId, useMap, names
   };
   if (controller) metadata.controller = resolveType(controller, useMap, namespace);
   if (action) metadata.action = action;
+  if (group.middleware.length > 0) metadata.middleware = group.middleware;
+  if (group.name) metadata.name = group.name;
 
   nodes.push({
     subproject_id: subprojectId,

@@ -372,8 +372,8 @@ All tools require `workspace_id` and `subproject_id`. They return JSON with `{ a
 | `oracle.nearby` | Symbols near a file location |
 | `oracle.consumers` | Direct users with call lines, transitive users, callers through the interface/parent a method implements, implementations, possible call sites (`complete: false`) |
 | `oracle.diff_since` | Changed files/symbols since a git ref |
-| `oracle.conventions_for` | Conventions for a topic (auth, errors, routing, etc.) |
-| `oracle.where_would` | Suggest where to place new code |
+| `oracle.conventions_for` | How the project handles a topic: base types, locations, route middleware, patterns, documented rules |
+| `oracle.where_would` | Path for new code, learned from files of the same kind (role from file-name suffix, parent directory or node kind; per-feature layouts; naming) |
 | `oracle.pattern` | Look up a pattern from the catalogue |
 | `oracle.impact` | Analyze impact of a proposed change |
 | `oracle.validate` | Validate proposed code against conventions |

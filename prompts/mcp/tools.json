@@ -171,7 +171,7 @@
   },
   {
     "name": "oracle.conventions_for",
-    "description": "Get conventions for a topic: patterns, canonical examples, manifest rules.",
+    "description": "How the project does something: base types the topic's code extends, where it lives, route middleware (auth/routing), recurring patterns, documented rules and examples.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -183,7 +183,7 @@
         },
         "topic": {
           "type": "string",
-          "description": "Topic: migrations, auth, validation, errors, routing, state, etc."
+          "description": "Topic: auth, validation, errors, routing, state, migrations, testing, or any other word (logging, caching...)"
         }
       },
       "required": [
@@ -195,7 +195,7 @@
   },
   {
     "name": "oracle.where_would",
-    "description": "Suggest where new code should be placed based on existing structure.",
+    "description": "Suggest the path for new code, learned from files of the same kind (controller, component, hook, migration...): the directory already used for that feature, the per-feature layout, or the main directory, named like its neighbours (prefix/suffix, timestamp, casing). Reports when the name already exists.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -207,7 +207,7 @@
         },
         "intent": {
           "type": "string",
-          "description": "What you want to create, e.g. \"user registration API\""
+          "description": "What to create, kind of code first, e.g. \"API controller for invoices\", \"reusable table component\", \"migration to add status to orders\""
         }
       },
       "required": [

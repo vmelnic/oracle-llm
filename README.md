@@ -158,8 +158,8 @@ Core tools require `workspace_id` + `subproject_id`. All return `{ answer, evide
 | Tool | Description |
 |------|-------------|
 | `oracle.context` | **Primary tool.** Full task packet: existing files, suggested creates/modifies, DB schema, patterns, conventions, relevant code |
-| `oracle.conventions_for` | Conventions for a `topic` (auth, routing, errors, validation, state, migrations) |
-| `oracle.where_would` | Suggest file placement for an `intent` (e.g. "user registration API") |
+| `oracle.conventions_for` | How the project handles a `topic` (auth, routing, errors, validation, state, migrations, testing or any word): base types, locations, route middleware, patterns, documented rules |
+| `oracle.where_would` | Path for new code (e.g. "API controller for invoices"), learned from files of the same kind and named like them |
 | `oracle.pattern` | Look up a named pattern from the catalogue |
 
 ### Validation

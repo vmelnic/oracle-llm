@@ -96,6 +96,14 @@ function groupByStructuralShape(nodes) {
   return groups;
 }
 
+// An explicit auth flag (decorators, attributes) or an auth middleware
+// (`auth:sanctum`, `jwt`, `can:edit`, `role:admin`).
+const AUTH_MIDDLEWARE = /auth|sanctum|passport|jwt|guard|^can:|^role|permission/i;
+
+function routeHasAuth(meta) {
+  return !!meta.auth || (Array.isArray(meta.middleware) && meta.middleware.some(m => AUTH_MIDDLEWARE.test(String(m))));
+}
+
 function computeShape(node) {
   const meta = safeParse(node.metadata);
   const kind = node.kind;
@@ -103,8 +111,7 @@ function computeShape(node) {
   if (kind === 'route') {
     const method = meta.method || 'GET';
     const pathDepth = (meta.path || '').split('/').filter(Boolean).length;
-    const hasAuth = !!meta.auth;
-    return `route:${method}:depth=${pathDepth}:auth=${hasAuth}`;
+    return `route:${method}:depth=${pathDepth}:auth=${routeHasAuth(meta)}`;
   }
 
   if (kind === 'method' || kind === 'function') {
@@ -225,7 +232,7 @@ function buildTemplate(node) {
 
   if (kind === 'route') {
     const method = meta.method || 'GET';
-    const auth = !!meta.auth;
+    const auth = routeHasAuth(meta);
     const routePath = meta.path || '';
     const mw = Array.isArray(meta.middleware) ? meta.middleware : [];
     return {

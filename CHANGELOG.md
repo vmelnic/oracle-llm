@@ -115,6 +115,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- `oracle.where_would` learns placement from the repository instead of picking the directory with the most classes. The intent's head noun is the role ("API *controller* for invoices"); its files are found by file-name suffix, parent directory or node kind. The proposal goes to the directory already holding that role for the feature, else the per-feature layout (`modules/<feature>/controllers`), else the main directory, with the alternative listed. Names copy the neighbours' prefix/suffix (`Api…Controller`, `use-…`), timestamp prefix, extension and casing; shared code ("reusable …") goes outside feature directories; tests and generated code are never proposed unless asked; an existing name is reported instead of inventing `name_2`.
+- `oracle.conventions_for` scores code by the topic's words in names, base types and paths (whole words and inflections: "log" matches logger, not login), and reports the base types the topic's code extends, where it lives, route middleware counts for auth/routing, matching patterns, documented rules and ranked examples. Any topic word works; multi-word topics say when only part of the words match.
+
 - `ORACLE_LLM_CTX_SIZE` defaults to 32768 (was 4096) so the local server fits the prompt plus a long answer; Qwen3-4B then holds ~4.8 GB resident instead of ~3.1 GB.
 - `ORACLE_L3_MAX_TOKENS` defaults to 32768 (was 256, which cut longer answers before their evidence line). A cut answer is now rejected with that reason, and repeated citations are listed once.
 - MCP server keeps per-subproject resources in reference-counted bundles, so a
@@ -195,6 +198,9 @@ All notable changes to this project are documented here. The format follows
 - The version is read from `package.json` everywhere.
 
 ### Fixed
+
+- Laravel routes include their group prefixes and middleware (`Route::prefix()->middleware()->group()`, `Route::group([...])`, chained `->middleware()` / `->withoutMiddleware()` / `->name()`), and `Route::match` lists its verbs. Routes declared in different groups no longer collapse into the same symbol. Route patterns count auth middleware as authenticated.
+- Evidence for routes (`GET /users/{id}`) and contract ids (`migration:<file>:<table>`) is verified by the name the source spells out, so `oracle.conventions_for` / `oracle.where_would` answers citing them are no longer rejected.
 
 - `oracle.context` returned the test pattern with all its members (hundreds of thousands of tokens before truncation); it now picks the pattern whose members mostly live in test files and returns its summary.
 - Every PHP method call was missing from the graph except calls on `$this`,
