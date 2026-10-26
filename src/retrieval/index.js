@@ -3,19 +3,21 @@ import path from 'path'
 import http from 'http'
 import https from 'https'
 import { URL } from 'url'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { atomicWriteFileSync } from '../utils/atomic-write.js'
 import { Bm25Index } from './bm25.js'
+import { nonNegativeInt } from '../utils/env.js'
 
 const EMBED_MODEL = process.env.ORACLE_EMBED_MODEL || ''
 const EMBED_API_URL = process.env.ORACLE_EMBED_API_URL || ''
 const EMBED_API_KEY = process.env.ORACLE_EMBED_API_KEY || ''
-const EMBED_DIMENSIONS = parseInt(process.env.ORACLE_EMBED_DIMENSIONS || '0', 10)
+const EMBED_DIMENSIONS = nonNegativeInt(process.env.ORACLE_EMBED_DIMENSIONS, 0)
 const EMBEDDINGS_ENV = process.env.ORACLE_EMBEDDINGS || ''
 // Max nodes to embed; 0 = embed all nodes
-const EMBED_MAX_NODES = parseInt(process.env.ORACLE_EMBED_MAX_NODES || '0', 10)
+const EMBED_MAX_NODES = nonNegativeInt(process.env.ORACLE_EMBED_MAX_NODES, 0)
 // Chunk size for remote embedding API requests
 const EMBED_API_BATCH = 256
+const EMBED_REQUEST_TIMEOUT_MS = 30_000
 
 export class L2Index {
   constructor(store, { indexPath, embeddings } = {}) {
@@ -23,6 +25,7 @@ export class L2Index {
     this.indexPath = indexPath
     this.bm25 = new Bm25Index()
     this.vectors = new Map()
+    this._norms = new Map()
     // Incremental embedding cache, keyed by content hash so it survives
     // node id churn across rebuilds: hash -> vec, plus id -> hash for save()
     this._hashToVec = new Map()
@@ -81,6 +84,7 @@ export class L2Index {
     if (entries.length === 0) {
       this.vectors = new Map()
       this._idToHash = new Map()
+      this._norms = new Map()
       return
     }
 
@@ -115,7 +119,7 @@ export class L2Index {
         const chunk = toEmbed.slice(i, i + EMBED_API_BATCH)
         const embeddings = await embedFn(chunk.map(e => e.text))
         for (let j = 0; j < chunk.length && j < embeddings.length; j++) {
-          this._hashToVec.set(chunk[j].hash, embeddings[j])
+          this._hashToVec.set(chunk[j].hash, Float32Array.from(embeddings[j]))
         }
       }
 
@@ -127,6 +131,7 @@ export class L2Index {
 
     this.vectors = newVectors
     this._idToHash = newIdToHash
+    this._computeNorms()
     this.lastEmbedStats = { total: entries.length, reused, embedded: toEmbed.length }
   }
 
@@ -135,7 +140,9 @@ export class L2Index {
 
     const bm25Results = this.bm25.search(query, opts)
 
-    if (this.vectors.size === 0) {
+    // Vectors need a configured embedding model to embed the query; without
+    // one (e.g. embeddings turned off after an ingest) BM25 alone answers.
+    if (this.vectors.size === 0 || !EMBED_MODEL) {
       return bm25Results
     }
 
@@ -158,8 +165,9 @@ export class L2Index {
         scores.set(r.id, { bm25: r.score, vec: 0, node: r.node })
       }
 
+      const queryNorm = vectorNorm(queryVec)
       for (const [id, vec] of this.vectors) {
-        const sim = cosineSimilarity(queryVec, vec)
+        const sim = cosineSimilarity(queryVec, queryNorm, vec, this._norms.get(id))
         if (!scores.has(id)) {
           const doc = this.bm25.documents.get(id)
           if (doc && (!opts.kinds || opts.kinds.length === 0 || opts.kinds.includes(doc.node.kind))) {
@@ -170,8 +178,13 @@ export class L2Index {
         }
       }
 
-      const bm25Max = Math.max(...[...scores.values()].map((s) => s.bm25), 1)
-      const vecMax = Math.max(...[...scores.values()].map((s) => s.vec), 1)
+      // Loop rather than Math.max(...spread): spreading 100k+ values overflows the stack.
+      let bm25Max = 1
+      let vecMax = 1
+      for (const s of scores.values()) {
+        if (s.bm25 > bm25Max) bm25Max = s.bm25
+        if (s.vec > vecMax) vecMax = s.vec
+      }
 
       const combined = []
       for (const [id, s] of scores) {
@@ -182,7 +195,8 @@ export class L2Index {
       combined.sort((a, b) => b.score - a.score)
       const limit = opts.limit || 10
       return combined.slice(0, limit)
-    } catch {
+    } catch (err) {
+      console.error(`[l2] semantic search failed, using BM25 only: ${err.message}`)
       return bm25Results
     }
   }
@@ -191,76 +205,107 @@ export class L2Index {
     return this.search(query, { ...opts, kinds: [kind] })
   }
 
+  /**
+   * On-disk layout (directory):
+   *   vectors.<gen>.bin        Float32 little-endian, vectors back to back
+   *   vectors.<gen>.meta.json  { dim, ids[], hashes[] }
+   *   bm25.json                BM25 data + `vectorsGeneration: <gen>`
+   * Vector files are written first and bm25.json last, so the atomic rename
+   * of bm25.json commits both together; a crash never pairs BM25 data with
+   * vectors keyed to different node ids. The previous generation is kept for
+   * readers that already hold the old bm25.json.
+   */
   save(outputPath) {
-    const baseDir = outputPath || this.indexPath;
-    if (!baseDir) throw new Error('No indexPath configured');
+    const baseDir = outputPath || this.indexPath
+    if (!baseDir) throw new Error('No indexPath configured')
 
-    const dir = baseDir.replace(/\.json$/, '');
-    fs.mkdirSync(dir, { recursive: true });
+    const dir = baseDir.replace(/\.json$/, '')
+    fs.mkdirSync(dir, { recursive: true })
 
-    const bm25Data = this.bm25.serialize();
-    atomicWriteFileSync(path.join(dir, 'bm25.json'), JSON.stringify(bm25Data, null, 2));
-
+    let generation = null
     if (this.vectors.size > 0) {
-      const vecData = [];
-      for (const [id, vec] of this.vectors) {
-        vecData.push({ id, hash: this._idToHash.get(id) || null, vec });
-      }
-      atomicWriteFileSync(path.join(dir, 'vectors.json'), JSON.stringify(vecData));
-    } else if (fs.existsSync(path.join(dir, 'vectors.json'))) {
-      fs.unlinkSync(path.join(dir, 'vectors.json'));
+      generation = `${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`
+      const ids = [...this.vectors.keys()]
+      const dim = this.vectors.get(ids[0]).length
+      const packed = new Float32Array(ids.length * dim)
+      ids.forEach((id, i) => packed.set(this.vectors.get(id).subarray(0, dim), i * dim))
+      atomicWriteFileSync(path.join(dir, `vectors.${generation}.bin`), Buffer.from(packed.buffer))
+      atomicWriteFileSync(path.join(dir, `vectors.${generation}.meta.json`), JSON.stringify({
+        dim,
+        ids,
+        hashes: ids.map(id => this._idToHash.get(id) || null),
+      }))
     }
+
+    const bm25Data = { ...this.bm25.serialize(), vectorsGeneration: generation }
+    atomicWriteFileSync(path.join(dir, 'bm25.json'), JSON.stringify(bm25Data))
+    pruneVectorGenerations(dir, generation, this._loadedGeneration)
+    this._loadedGeneration = generation
   }
 
   load(inputPath) {
-    const baseDir = inputPath || this.indexPath;
+    const baseDir = inputPath || this.indexPath
     if (!baseDir) {
-      this.loaded = false;
-      return false;
+      this.loaded = false
+      return false
     }
 
-    const dir = baseDir.replace(/\.json$/, '');
+    const dir = baseDir.replace(/\.json$/, '')
 
-    const legacyFile = baseDir.endsWith('.json') && fs.existsSync(baseDir) ? baseDir : null;
-    const bm25File = path.join(dir, 'bm25.json');
+    // Pre-directory indexes were a single `<dir>.json` file.
+    const legacyFile = `${dir}.json`
+    const bm25File = path.join(dir, 'bm25.json')
 
-    const dataFile = fs.existsSync(bm25File) ? bm25File : legacyFile;
-    if (!dataFile || !fs.existsSync(dataFile)) {
-      this.loaded = false;
-      return false;
+    const dataFile = [bm25File, legacyFile].find(file => fs.existsSync(file))
+    if (!dataFile) {
+      this.loaded = false
+      return false
     }
 
-    const data = JSON.parse(fs.readFileSync(dataFile, 'utf-8'));
-    this.bm25.load(data);
+    const data = JSON.parse(fs.readFileSync(dataFile, 'utf-8'))
+    this.bm25.load(data)
 
-    const vecFile = path.join(dir, 'vectors.json');
-    if (fs.existsSync(vecFile)) {
-      const vecData = JSON.parse(fs.readFileSync(vecFile, 'utf-8'));
-      this.vectors.clear();
-      this._hashToVec.clear();
-      this._idToHash.clear();
-      for (const { id, hash, vec } of vecData) {
-        this.vectors.set(id, vec);
-        if (hash) {
-          this._hashToVec.set(hash, vec);
-          this._idToHash.set(id, hash);
-        }
-      }
-    } else if (data.vectors) {
-      this.vectors.clear();
-      this._hashToVec.clear();
-      this._idToHash.clear();
-      for (const { id, hash, vec } of data.vectors) {
-        this.vectors.set(id, vec);
-        if (hash) {
-          this._hashToVec.set(hash, vec);
-          this._idToHash.set(id, hash);
-        }
-      }
+    this.vectors.clear()
+    this._hashToVec.clear()
+    this._idToHash.clear()
+    if (data.vectorsGeneration) {
+      this._loadBinaryVectors(dir, data.vectorsGeneration)
+    } else if (!('vectorsGeneration' in data)) {
+      // Index written before binary vectors existed.
+      const vecFile = path.join(dir, 'vectors.json')
+      const legacyVectors = fs.existsSync(vecFile)
+        ? JSON.parse(fs.readFileSync(vecFile, 'utf-8'))
+        : (data.vectors || [])
+      for (const { id, hash, vec } of legacyVectors) this._setVector(id, hash, Float32Array.from(vec))
     }
+    this._loadedGeneration = data.vectorsGeneration || null
+    this._computeNorms()
 
-    this.loaded = true;
-    return true;
+    this.loaded = true
+    return true
+  }
+
+  _loadBinaryVectors(dir, generation) {
+    const meta = JSON.parse(fs.readFileSync(path.join(dir, `vectors.${generation}.meta.json`), 'utf-8'))
+    const raw = fs.readFileSync(path.join(dir, `vectors.${generation}.bin`))
+    // Copy into a fresh, 4-byte-aligned buffer (pooled Buffers may be unaligned).
+    const all = new Float32Array(raw.buffer.slice(raw.byteOffset, raw.byteOffset + raw.byteLength))
+    const { dim, ids, hashes } = meta
+    if (all.length !== ids.length * dim) throw new Error(`Corrupt vector index: ${generation}`)
+    ids.forEach((id, i) => this._setVector(id, hashes[i], all.subarray(i * dim, (i + 1) * dim)))
+  }
+
+  _setVector(id, hash, vec) {
+    this.vectors.set(id, vec)
+    if (hash) {
+      this._hashToVec.set(hash, vec)
+      this._idToHash.set(id, hash)
+    }
+  }
+
+  _computeNorms() {
+    this._norms = new Map()
+    for (const [id, vec] of this.vectors) this._norms.set(id, vectorNorm(vec))
   }
 
   isLoaded() {
@@ -402,7 +447,9 @@ async function fetchEmbeddings(texts) {
         'Content-Length': Buffer.byteLength(body),
         ...(EMBED_API_KEY ? { Authorization: `Bearer ${EMBED_API_KEY}` } : {}),
       },
-      timeout: 30000,
+      // Total deadline, not an idle timeout: this also runs inside MCP queries
+      // (hybrid search), where a slowly trickling response must not hang them.
+      signal: AbortSignal.timeout(EMBED_REQUEST_TIMEOUT_MS),
     }
 
     const req = mod.request(reqOpts, (res) => {
@@ -434,25 +481,43 @@ async function fetchEmbeddings(texts) {
       })
     })
 
-    req.on('error', reject)
-    req.on('timeout', () => { req.destroy(); reject(new Error('Embedding request timed out')) })
+    req.on('error', (err) => {
+      reject(err.name === 'AbortError' || err.name === 'TimeoutError'
+        ? new Error(`Embedding request timed out after ${EMBED_REQUEST_TIMEOUT_MS}ms`, { cause: err })
+        : err)
+    })
     req.write(body)
     req.end()
   })
 }
 
-function cosineSimilarity(a, b) {
+function vectorNorm(vec) {
+  let sum = 0
+  for (let i = 0; i < vec.length; i++) sum += vec[i] * vec[i]
+  return Math.sqrt(sum)
+}
+
+function cosineSimilarity(a, normA, b, normB) {
   if (!a || !b || a.length !== b.length) return 0
   let dot = 0
-  let normA = 0
-  let normB = 0
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i]
-    normA += a[i] * a[i]
-    normB += b[i] * b[i]
-  }
-  const denom = Math.sqrt(normA) * Math.sqrt(normB)
+  for (let i = 0; i < a.length; i++) dot += a[i] * b[i]
+  const denom = normA * (normB ?? vectorNorm(b))
   return denom === 0 ? 0 : dot / denom
+}
+
+// Drops vector generations other than the current and the one this process
+// last loaded, plus the legacy vectors.json (superseded by any new save).
+function pruneVectorGenerations(dir, current, previous) {
+  const keep = new Set([current, previous].filter(Boolean))
+  for (const name of fs.readdirSync(dir)) {
+    const match = name.match(/^vectors\.(.+?)\.(?:bin|meta\.json)$/)
+    if (match && !keep.has(match[1])) {
+      try { fs.unlinkSync(path.join(dir, name)) } catch {}
+    }
+  }
+  if (fs.existsSync(path.join(dir, 'vectors.json'))) {
+    try { fs.unlinkSync(path.join(dir, 'vectors.json')) } catch {}
+  }
 }
 
 function safeParse(json) {

@@ -13,14 +13,18 @@ export function whereWould(ctx, { intent }) {
 
   const candidateNodes = [];
 
+  // Symbols named in the intent ("similar to globFiles") anchor the location;
+  // only without them does the directory holding most nodes of a kind decide.
   for (const kw of keywords) {
     const bySymbol = store.findNodes({ subprojectId: subId, symbol: kw });
     candidateNodes.push(...bySymbol);
   }
 
-  for (const kind of kindHints) {
-    const byKind = store.findNodes({ subprojectId: subId, kind });
-    candidateNodes.push(...byKind);
+  if (candidateNodes.length === 0) {
+    for (const kind of kindHints) {
+      const byKind = store.findNodes({ subprojectId: subId, kind });
+      candidateNodes.push(...byKind);
+    }
   }
 
   if (candidateNodes.length === 0) {
@@ -35,6 +39,9 @@ export function whereWould(ctx, { intent }) {
   }
 
   const deduped = deduplicateById(candidateNodes);
+  // Symbols the intent names verbatim (lowercased) are analogs, not new names.
+  const mentionedSymbols = new Set(deduped.map((n) => n.symbol.split('.').pop().toLowerCase())
+    .filter((sym) => keywords.some((k) => k.toLowerCase() === sym)));
 
   const dirFrequency = new Map();
   for (const node of deduped) {
@@ -43,7 +50,7 @@ export function whereWould(ctx, { intent }) {
     entry.count++;
     entry.kinds.add(node.kind);
     if (entry.examples.length < 3) {
-      entry.examples.push({ symbol: node.symbol, path: node.path, kind: node.kind });
+      entry.examples.push({ symbol: node.symbol, path: node.path, kind: node.kind, line_range: [node.start_line, node.end_line] });
     }
     dirFrequency.set(dir, entry);
   }
@@ -67,12 +74,12 @@ export function whereWould(ctx, { intent }) {
     const topDir = sorted[0][0];
 
     const analog = deduped.find((n) => n.kind === kind && path.dirname(n.path) === topDir);
-    const suggestedName = buildFilename(intent, kind, analog);
+    const suggestedName = buildFilename(intent, kind, analog, siblingFiles(store, subId, topDir), topDir, mentionedSymbols);
 
     proposedPaths.push({
       path: path.join(topDir, suggestedName),
-      reason: `${sorted[0][1]} existing ${kind} node(s) live in ${topDir}`,
-      analog: analog ? { path: analog.path, symbol: analog.symbol } : null,
+      reason: placementReason(store, subId, topDir, analog, mentionedSymbols),
+      analog: analog ? { path: analog.path, symbol: analog.symbol, line_range: [analog.start_line, analog.end_line] } : null,
     });
   }
 
@@ -82,16 +89,25 @@ export function whereWould(ctx, { intent }) {
     const example = sorted[0][1].examples[0];
 
     proposedPaths.push({
-      path: path.join(topDir, buildFilename(intent, null, example)),
-      reason: `Most active directory with ${sorted[0][1].count} nodes`,
-      analog: example ? { path: example.path, symbol: example.symbol } : null,
+      path: path.join(topDir, buildFilename(intent, null, example, siblingFiles(store, subId, topDir), topDir, mentionedSymbols)),
+      reason: placementReason(store, subId, topDir, example, mentionedSymbols),
+      analog: example ? { path: example.path, symbol: example.symbol, line_range: example.line_range } : null,
     });
   }
+
+  // When some proposal's directory relates to the intent ("contract detector"
+  // -> src/contracts/detectors), drop the ones picked only because a
+  // directory holds many nodes of a kind.
+  const intentWords = keywords.map((k) => k.toLowerCase().replace(/s$/, '')).filter((k) => k.length >= 3);
+  const related = proposedPaths.filter((p) => path.dirname(p.path).toLowerCase().split(/[\\/]/)
+    .some((segment) => intentWords.some((w) => segment.replace(/s$/, '') === w)));
+  if (related.length > 0 && related.length < proposedPaths.length) proposedPaths.splice(0, proposedPaths.length, ...related);
 
   const evidence = proposedPaths
     .filter((p) => p.analog)
     .map((p) => ({
       path: p.analog.path,
+      ...(p.analog.line_range?.[0] ? { line_range: p.analog.line_range } : {}),
       symbol: p.analog.symbol,
       reason: p.reason,
     }));
@@ -103,11 +119,24 @@ export function whereWould(ctx, { intent }) {
   };
 }
 
+// Why this directory, in true terms: the symbol the request named lives
+// there, or the directory's actual size (not the number of matches).
+function placementReason(store, subprojectId, dir, analog, mentionedSymbols) {
+  if (analog && mentionedSymbols.has(analog.symbol.split('.').pop().toLowerCase())) {
+    return `${analog.symbol}, named in the request, lives in ${dir}`;
+  }
+  const files = siblingFiles(store, subprojectId, dir).length;
+  return `${dir} holds ${files} existing file(s)${analog ? `, e.g. ${analog.symbol}` : ''}`;
+}
+
 function extractKeywords(intent) {
   const stopWords = new Set([
     'a', 'an', 'the', 'and', 'or', 'for', 'to', 'in', 'of', 'with', 'on',
     'is', 'it', 'at', 'by', 'from', 'as', 'new', 'add', 'create', 'make',
-    'build', 'implement', 'write', 'update', 'modify', 'change',
+    'build', 'implement', 'write', 'update', 'modify', 'change', 'that',
+    'which', 'this', 'returns', 'return', 'get', 'gets', 'show', 'shows',
+    'some', 'any', 'all', 'into', 'when', 'where', 'how', 'similar',
+    'like', 'based', 'using', 'module', 'file', 'code',
   ]);
 
   return intent
@@ -138,28 +167,60 @@ function inferKinds(intent) {
   return [...new Set(kinds)];
 }
 
-function buildFilename(intent, kind, analog) {
-  const words = extractKeywords(intent);
-  const base = words
-    .slice(0, 3)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
-    .join('');
+// File name for new code, following the naming style of the files already in
+// the target directory and dropping words the directory already says
+// (`contract detector for AsyncAPI` in src/contracts/detectors -> asyncapi.js).
+function buildFilename(intent, kind, analog, siblings, dir, existingNames = new Set()) {
+  const dirWords = dir.toLowerCase().split(/[\\/]+/);
+  const implied = (w) => dirWords.some(d => d.startsWith(w) || w.startsWith(d.replace(/s$/, '')));
+  const siblingNames = new Set(siblings.map(n => n.toLowerCase()));
+  // "similar to locate": `locate` names the analog, not the new file.
+  const existing = (w) => existingNames.has(w) || siblingNames.has(w);
+  const words = extractKeywords(intent).map(w => w.toLowerCase());
+  const specific = words.filter(w => !implied(w) && !existing(w));
+  // Without a specific word left, say what it is: new-component, new-module...
+  const genericKind = !kind || kind === 'function' || kind === 'class' ? 'module' : kind.replace(/_/g, '-');
+  const chosen = specific.length > 0 ? specific.slice(0, 3) : ['new', genericKind];
 
-  if (analog) {
-    const ext = path.extname(analog.path);
-    return `${base}${ext}`;
-  }
-
-  const extMap = {
+  const ext = analog ? path.extname(analog.path) : ({
     route: '.php',
     api_endpoint: '.php',
     migration: '.php',
     component: '.vue',
-    hook: '.js',
-    store: '.js',
-  };
+  }[kind] || '.js');
 
-  return `${base}${extMap[kind] || '.js'}`;
+  const style = detectNamingStyle(siblings);
+  let base = applyNamingStyle(chosen, style);
+  // Never propose a file that already exists.
+  for (let i = 2; siblingNames.has(base.toLowerCase()); i++) base = applyNamingStyle([...chosen, String(i)], style);
+  return `${base}${ext}`;
+}
+
+function siblingFiles(store, subprojectId, dir) {
+  return store.getIndexedFiles(subprojectId)
+    .filter(file => path.dirname(file) === dir)
+    .map(file => path.basename(file, path.extname(file)));
+}
+
+function detectNamingStyle(names) {
+  const counts = { kebab: 0, snake: 0, pascal: 0, camel: 0 };
+  for (const name of names) {
+    if (name.includes('-')) counts.kebab++;
+    else if (name.includes('_')) counts.snake++;
+    else if (/^[A-Z]/.test(name)) counts.pascal++;
+    else if (/[a-z][A-Z]/.test(name)) counts.camel++;
+  }
+  const [style, count] = Object.entries(counts).sort((a, b) => b[1] - a[1])[0];
+  // Single-word lowercase names (index.js, store.js) read best as kebab-case.
+  return count > 0 ? style : (names.length > 0 ? 'kebab' : 'pascal');
+}
+
+function applyNamingStyle(words, style) {
+  const cap = (w) => w.charAt(0).toUpperCase() + w.slice(1);
+  if (style === 'kebab') return words.join('-');
+  if (style === 'snake') return words.join('_');
+  if (style === 'camel') return words[0] + words.slice(1).map(cap).join('');
+  return words.map(cap).join('');
 }
 
 function deduplicateById(nodes) {

@@ -1,11 +1,18 @@
-import path from 'path';
 import { whereWould } from './where-would.js';
+import { positiveInt } from '../../utils/env.js';
 import { conventionsFor } from './conventions-for.js';
 import { pattern as patternTool } from './pattern.js';
-import { impact as impactTool } from './impact.js';
+
+const RELEVANCE_FLOOR = 0.2;
+const CODE_KINDS = new Set(['function', 'method', 'hook', 'component', 'route']);
+const CALLABLE_KINDS = new Set(['function', 'method', 'hook']);
+const CALLEE_SEEDS = 25;
+const CALLEE_DEPTH = 2;
+const CALLEE_DECAY = 0.35;
+const CREATION_INTENT = /\b(add|create|new|implement|build|write|introduce|scaffold|generate)\b/i;
 
 export async function context(ctx, { task }) {
-  const { store, subproject, patterns, manifest, l2 } = ctx;
+  const { store, subproject, patterns, l2 } = ctx;
 
   if (!task) {
     return {
@@ -30,7 +37,9 @@ export async function context(ctx, { task }) {
   let matchingNodes = findMatchingNodes(allNodes, keywords);
 
   if (l2 && l2.isLoaded()) {
-    const l2Results = await l2.search(task, { limit: 20 });
+    // Search with the meaningful words only: raw question words ("where")
+    // would match unrelated paths such as where-would.js.
+    const l2Results = await l2.search(keywords.join(' ') || task, { limit: 20 });
     const maxBm25 = l2Results.length > 0 ? l2Results[0].score : 1;
     for (const r of l2Results) {
       const normalizedScore = (r.score / (maxBm25 || 1)) * 10;
@@ -48,7 +57,33 @@ export async function context(ctx, { task }) {
 
   matchingNodes = graphRerank(store, matchingNodes, allNodes);
 
-  const existing = matchingNodes.slice(0, 20).map((n) => ({
+  // Keep everything clearly related to the task, not a fixed top-N: a broad
+  // question ("how does login work") can span dozens of symbols. Relevance
+  // is relative to the best match; ORACLE_CONTEXT_MAX_NODES is a safety cap.
+  // Exact symbol matches always stay; the floor is measured against the best
+  // non-exact match, so a function literally named `ingest` cannot push out
+  // everything else that implements ingest.
+  const exactMatches = matchingNodes.filter((n) => n._exact);
+  const others = matchingNodes.filter((n) => !n._exact);
+  // Callers and callees of relevant code stay too: they are included by the
+  // graph, not by score.
+  const floor = (others[0]?._score || 0) * RELEVANCE_FLOOR;
+  // When the cap bites, fill it by evidence strength, not raw score: words of
+  // the task in the symbol, then what that code calls / is called by, then
+  // semantic-only (L2) hits, then neighbours that merely sit nearby.
+  const tier = (n) => {
+    if (n._exact) return 0;
+    if (n._layer === 'L1' || n._layer === 'L1+L2' || n._layer === undefined) return n._score >= floor ? 1 : 2;
+    if (n._caller || n._callee) return 2;
+    return n._layer === 'L2' ? 3 : 4;
+  };
+  const relevant = [...exactMatches, ...others.filter((n) => n._score >= floor || n._caller || n._callee)]
+    .map((n, i) => ({ n, i, t: tier(n) }))
+    .sort((a, b) => a.t - b.t || a.i - b.i)
+    .map(({ n }) => n)
+    .slice(0, positiveInt(process.env.ORACLE_CONTEXT_MAX_NODES, 50));
+
+  const existing = relevant.map((n) => ({
     path: n.path,
     role: n.kind,
     symbols: [n.symbol],
@@ -64,11 +99,12 @@ export async function context(ctx, { task }) {
   }
   const dedupedExisting = [...existingByPath.values()];
 
-  const whereResult = whereWould(ctx, { intent: task });
-  const create = whereResult.answer.proposed_paths || [];
+  // New-file suggestions only make sense when the task creates something;
+  // for "explain how X works" they would just be invented file names.
+  const create = CREATION_INTENT.test(task) ? (whereWould(ctx, { intent: task }).answer.proposed_paths || []) : [];
 
   const modify = [];
-  for (const node of matchingNodes.slice(0, 10)) {
+  for (const node of relevant) {
     const consumers = store.getConsumers(node.id);
     if (consumers.length > 0) {
       modify.push({
@@ -190,14 +226,14 @@ export async function context(ctx, { task }) {
 
   const hasL2 = matchingNodes.some((n) => n._layer === 'L2');
 
-  const relevantCode = matchingNodes.slice(0, 10).map((n) => ({
+  const relevantCode = relevant.map((n) => ({
     path: n.path,
     line_range: [n.start_line, n.end_line],
     snippet_summary: `${n.kind} ${n.symbol}${n.signature ? ` — ${n.signature}` : ''}`,
   }));
 
   const evidence = [];
-  for (const node of matchingNodes.slice(0, 15)) {
+  for (const node of relevant) {
     evidence.push({
       path: node.path,
       line_range: [node.start_line, node.end_line],
@@ -229,6 +265,9 @@ function extractKeywords(task) {
     'want', 'should', 'would', 'could', 'that', 'this', 'will', 'be',
     'have', 'has', 'been', 'was', 'were', 'are', 'can', 'do', 'does',
     'did', 'not', 'but', 'if', 'then', 'than', 'so', 'up', 'out',
+    // Question words carry no code meaning ("how X works", "where it is used").
+    'explain', 'how', 'what', 'why', 'where', 'when', 'which', 'who', 'works',
+    'work', 'working', 'used', 'use', 'uses', 'using', 'show', 'find', 'me', 'about',
   ]);
 
   return task
@@ -264,29 +303,52 @@ function computeIdf(allNodes, keywords) {
   return idf;
 }
 
+// Members and properties matched only through their class's name
+// (`LoginRequest::rules`) say less than symbols that carry the word themselves
+// (`UserController::loginForm`); the class itself already stands for them.
+const OWNER_ONLY_FACTOR = 0.3;
+const PROPERTY_FACTOR = 0.5;
+// Tests rank below the code they test unless the task is about tests.
+const TEST_FACTOR = 0.5;
+const TEST_PATH = /(^|\/)(tests?|__tests__|spec|specs)(\/|$)|\.(test|spec)\.[a-z]+$|_test\.[a-z]+$|Test\.php$/i;
+
 function findMatchingNodes(allNodes, keywords) {
   const idf = computeIdf(allNodes, keywords);
   const scored = [];
+  const aboutTests = keywords.some((k) => /^(tests?|specs?|testing)$/i.test(k));
 
   for (const node of allNodes) {
     let score = 0;
     const symTokens = tokenize(node.symbol);
+    const memberTokens = tokenize(memberOf(node.symbol));
     const pathTokens = tokenize(node.path);
     let distinctMatches = 0;
+    const isMember = node.kind === 'method' || node.kind === 'property';
 
+    const symLower = node.symbol.toLowerCase();
+    const symName = symLower.split('.').pop();
+    let exact = false;
     for (const kw of keywords) {
       const kwLower = kw.toLowerCase();
       const kwWeight = idf.get(kwLower) || 1;
       let matched = false;
 
-      if (symTokens.includes(kwLower)) {
+      // A symbol named verbatim in the task ("how GraphStore works") is the
+      // strongest signal; tokenizing it into "graph"/"store" would lose it.
+      if (symName === kwLower || symLower === kwLower) {
+        score += 50 * kwWeight;
+        matched = true;
+        exact = true;
+      } else if (symTokens.includes(kwLower)) {
         const isExact = symTokens.length === 1;
-        score += (isExact ? 10 : 5) * kwWeight;
+        const ownerOnly = isMember && !memberTokens.includes(kwLower);
+        score += (isExact ? 10 : 5) * kwWeight * (ownerOnly ? OWNER_ONLY_FACTOR : 1);
         matched = true;
       }
 
       if (pathTokens.includes(kwLower)) {
-        score += 3 * kwWeight;
+        const ownerOnly = isMember && !memberTokens.includes(kwLower);
+        score += 3 * kwWeight * (ownerOnly ? OWNER_ONLY_FACTOR : 1);
         matched = true;
       }
 
@@ -295,34 +357,91 @@ function findMatchingNodes(allNodes, keywords) {
 
     if (node.exported) score += 1;
     if (distinctMatches > 1) score *= 1 + 0.5 * (distinctMatches - 1);
+    if (node.kind === 'property') score *= PROPERTY_FACTOR;
+    if (!aboutTests && TEST_PATH.test(node.path)) score *= TEST_FACTOR;
 
     if (score > 0) {
-      scored.push({ ...node, _score: score });
+      scored.push({ ...node, _score: score, ...(exact ? { _exact: true } : {}) });
     }
   }
 
   return scored.sort((a, b) => b._score - a._score);
 }
 
+// Last name segment: `App\\Foo::bar` -> `bar`, `Foo.bar` -> `bar`.
+function memberOf(symbol) {
+  const text = String(symbol);
+  const cut = Math.max(text.lastIndexOf('::') + 1, text.lastIndexOf('.'), text.lastIndexOf('\\'));
+  return cut > 0 ? text.slice(cut + 1) : text;
+}
+
 function graphRerank(store, matchingNodes, allNodes) {
   if (matchingNodes.length === 0) return matchingNodes;
+
+  // Built once per call: lookups below must not scan every node per item.
+  const byId = new Map(allNodes.map((n) => [n.id, n]));
+  const matchedIds = new Set(matchingNodes.map((n) => n.id));
+
+  // Callers are part of "how does X work": every relevant match brings its
+  // callers, ranked after the direct matches (a verbatim symbol's callers
+  // first) but never below the relevance floor, so they are kept.
+  const bestOther = matchingNodes.find((n) => !n._exact)?._score || 0;
+  const seeds = matchingNodes.filter((n) => n._exact || n._score >= bestOther * RELEVANCE_FLOOR);
+  for (const seed of seeds) {
+    for (const consumer of store.getConsumers(seed.id)) {
+      if (consumer.path === seed.path) continue;
+      const score = seed._score * (seed._exact ? 0.6 : 0.4);
+      const existing = matchingNodes.find((n) => n.id === consumer.id);
+      if (existing) {
+        existing._score = Math.max(existing._score, score);
+        existing._caller = true;
+      } else if (byId.has(consumer.id)) {
+        matchingNodes.push({ ...byId.get(consumer.id), _score: score, _layer: 'graph', _caller: true });
+        matchedIds.add(consumer.id);
+      }
+    }
+  }
+  // What relevant code calls is part of it too (the action a controller runs,
+  // the token that action issues): callees of the strongest code seeds, two
+  // calls deep. Code nobody calls (framework hooks such as `rules()`) gets no
+  // boost this way.
+  let frontier = seeds.filter((n) => CODE_KINDS.has(n.kind)).slice(0, CALLEE_SEEDS);
+  for (let depth = 0; depth < CALLEE_DEPTH && frontier.length > 0; depth++) {
+    const next = [];
+    for (const seed of frontier) {
+      for (const edge of store.getProducers(seed.id)) {
+        if (edge.kind !== 'calls' || !CALLABLE_KINDS.has(edge.target_kind)) continue;
+        const score = seed._score * CALLEE_DECAY;
+        let node = matchingNodes.find((n) => n.id === edge.target_id);
+        if (node) {
+          if (score > node._score) node._score = score;
+          node._callee = true;
+        } else if (byId.has(edge.target_id)) {
+          node = { ...byId.get(edge.target_id), _score: score, _layer: 'graph', _callee: true };
+          matchingNodes.push(node);
+          matchedIds.add(edge.target_id);
+        }
+        if (node) next.push(node);
+      }
+    }
+    frontier = next;
+  }
+  matchingNodes.sort((a, b) => b._score - a._score);
 
   const seedIds = new Set(matchingNodes.slice(0, 30).map((n) => n.id));
   const neighborScores = new Map();
 
   for (const id of seedIds) {
-    const consumers = store.getConsumers(id);
-    const producers = store.getProducers(id);
-    for (const n of consumers) {
+    for (const n of store.getConsumers(id)) {
       neighborScores.set(n.id, (neighborScores.get(n.id) || 0) + 1);
     }
-    for (const e of producers) {
-      const targetId = e.target_id;
-      if (targetId) neighborScores.set(targetId, (neighborScores.get(targetId) || 0) + 1);
+    for (const e of store.getProducers(id)) {
+      if (e.target_id) neighborScores.set(e.target_id, (neighborScores.get(e.target_id) || 0) + 1);
     }
   }
 
-  const maxConnections = Math.max(...neighborScores.values(), 1);
+  let maxConnections = 1;
+  for (const v of neighborScores.values()) if (v > maxConnections) maxConnections = v;
 
   for (const node of matchingNodes) {
     const connections = neighborScores.get(node.id) || 0;
@@ -331,40 +450,38 @@ function graphRerank(store, matchingNodes, allNodes) {
     }
   }
 
-  const matchedIds = new Set(matchingNodes.map((n) => n.id));
   for (const [neighborId, connections] of neighborScores) {
     if (matchedIds.has(neighborId) || connections < 2) continue;
-    const node = allNodes.find((n) => n.id === neighborId);
+    const node = byId.get(neighborId);
     if (node) {
-      const score = (connections / maxConnections) * 5;
-      matchingNodes.push({ ...node, _score: score, _layer: 'graph' });
+      matchingNodes.push({ ...node, _score: (connections / maxConnections) * 5, _layer: 'graph' });
       matchedIds.add(neighborId);
     }
   }
 
+  // Path-token document frequencies, computed once over all nodes.
+  const nodePathTokens = new Map(allNodes.map((n) => [n.id, tokenize(n.path)]));
   const seedPathTokens = new Set();
   for (const node of matchingNodes.slice(0, 20)) {
-    for (const t of tokenize(node.path)) seedPathTokens.add(t);
+    for (const t of nodePathTokens.get(node.id) || tokenize(node.path)) seedPathTokens.add(t);
   }
-
-  const pathTokenIdf = new Map();
+  const df = new Map();
+  for (const tokens of nodePathTokens.values()) {
+    for (const t of new Set(tokens)) if (seedPathTokens.has(t)) df.set(t, (df.get(t) || 0) + 1);
+  }
   const N = allNodes.length || 1;
+  const pathTokenIdf = new Map();
   for (const tok of seedPathTokens) {
-    let df = 0;
-    for (const n of allNodes) {
-      if (tokenize(n.path).includes(tok)) df++;
-    }
-    const idf = Math.log(N / (1 + df));
+    const idf = Math.log(N / (1 + (df.get(tok) || 0)));
     if (idf > 0.5) pathTokenIdf.set(tok, idf);
   }
 
   if (pathTokenIdf.size > 0) {
     for (const node of allNodes) {
       if (matchedIds.has(node.id)) continue;
-      const nodePathTokens = tokenize(node.path);
       let proximityScore = 0;
       let rareMatches = 0;
-      for (const t of nodePathTokens) {
+      for (const t of nodePathTokens.get(node.id)) {
         const idf = pathTokenIdf.get(t);
         if (idf) {
           proximityScore += idf;
@@ -376,6 +493,15 @@ function graphRerank(store, matchingNodes, allNodes) {
         matchedIds.add(node.id);
       }
     }
+  }
+
+  // Neighbours and path-proximity nodes only fill leftover room: never above
+  // the relevance floor, so direct matches, callers and callees come first.
+  const direct = matchingNodes.filter((n) => n._layer !== 'proximity' && !(n._layer === 'graph' && !n._caller && !n._callee));
+  const bestDirect = direct.filter((n) => !n._exact).reduce((max, n) => Math.max(max, n._score), 0);
+  const ceiling = bestDirect * RELEVANCE_FLOOR;
+  for (const node of matchingNodes) {
+    if (!direct.includes(node) && node._score > ceiling) node._score = ceiling;
   }
 
   matchingNodes.sort((a, b) => b._score - a._score);
@@ -409,12 +535,20 @@ function findBestPattern(patterns, matchingNodes, kind) {
   };
 }
 
+// The pattern whose members mostly live in test files (by count), trimmed
+// to its summary: a pattern can have thousands of members.
 function findBestPatternByPath(patterns, pathSegment) {
-  const allPatterns = patterns.listPatterns();
-  return allPatterns.find((p) => {
+  let best = null;
+  for (const p of patterns.listPatterns()) {
     const members = p.members || [];
-    return members.some((m) => m.path.toLowerCase().includes(pathSegment));
-  }) || null;
+    if (members.length === 0) continue;
+    const inPath = members.filter((m) => String(m.path).toLowerCase().includes(pathSegment)).length;
+    if (inPath / members.length < 0.5) continue;
+    if (!best || inPath > best.inPath) best = { p, inPath };
+  }
+  if (!best) return null;
+  const { name, kind, frequency, template, canonical } = best.p;
+  return { name, kind, frequency, template, canonical };
 }
 
 function inferConventionTopics(task) {

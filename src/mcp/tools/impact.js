@@ -1,3 +1,5 @@
+import { possibleCallSites, relatedMethods } from '../../graph/usage.js';
+
 export function impact(ctx, { change }) {
   const { store, subproject, manifest } = ctx;
 
@@ -19,13 +21,29 @@ export function impact(ctx, { change }) {
   }
 
   const subId = subproject?.id ?? subproject;
-  const tokens = parseChangeDescription(change);
+  const tokens = parseChangeDescription(change, knownSchema(store, subId));
   const seedNodes = findSeedNodes(store, subId, tokens);
   const seedIds = seedNodes.map((n) => n.id);
 
   let affected = [];
   if (seedIds.length > 0) {
     affected = store.impact(subId, seedIds);
+  }
+
+  // Methods are also reached through the interface or parent declaration
+  // they implement, and by calls whose receiver type is unknown.
+  const affectedIds = new Set([...seedIds, ...affected.map(a => a.id)]);
+  const unresolvedCallSites = [];
+  for (const seed of seedNodes.filter(n => n.kind === 'method')) {
+    for (const decl of relatedMethods(store, subId, seed).overrides) {
+      for (const caller of store.impact(subId, [decl.id])) {
+        if (affectedIds.has(caller.id)) continue;
+        affectedIds.add(caller.id);
+        affected.push({ ...caller, via_declaration: decl.symbol });
+      }
+    }
+    const possible = possibleCallSites(store, subId, subproject?.root, seed);
+    for (const site of possible.sites) unresolvedCallSites.push({ method: seed.symbol, ...site });
   }
 
   const allAffected = [...seedNodes, ...affected];
@@ -73,6 +91,9 @@ export function impact(ctx, { change }) {
   if (affectedComponents.length > 0) recommendations.push(`Check ${affectedComponents.length} affected component(s).`);
   if (breaking) recommendations.push('This is a breaking change — coordinate with consumers.');
   if (hardcodedChecks.length > 0) recommendations.push(`Review ${hardcodedChecks.length} hardcoded reference(s).`);
+  if (unresolvedCallSites.length > 0) {
+    recommendations.push(`Review ${unresolvedCallSites.length} file(s) calling a method of the same name on a receiver of unknown type (unresolved_call_sites).`);
+  }
 
   const evidence = seedNodes.slice(0, 10).map((n) => ({
     path: n.path,
@@ -105,39 +126,55 @@ export function impact(ctx, { change }) {
       recommendation: recommendations.join(' ') || 'No issues detected.',
       seed_nodes: seedNodes.length,
       total_affected: affected.length,
+      ...(unresolvedCallSites.length > 0 ? { unresolved_call_sites: unresolvedCallSites } : {}),
     },
     evidence,
     layer: 'L1',
+    ...(unresolvedCallSites.length > 0 ? { confidence_cap: 0.7 } : {}),
   };
 }
 
-function parseChangeDescription(change) {
+// Tables and columns the indexed schema knows about (db_table nodes).
+function knownSchema(store, subId) {
+  const tables = new Set();
+  const columns = new Set();
+  for (const node of store.findNodes({ subprojectId: subId, kind: 'db_table' })) {
+    tables.add(node.symbol.toLowerCase());
+    for (const col of safeParse(node.metadata).columns || []) {
+      const name = typeof col === 'string' ? col : col?.name;
+      if (name) columns.add(name.toLowerCase());
+    }
+  }
+  return { tables, columns };
+}
+
+function matchAll(text, patterns) {
+  const found = [];
+  for (const pat of patterns) {
+    for (const m of text.matchAll(pat)) found.push(m[1].toLowerCase());
+  }
+  return found;
+}
+
+// A word only counts as a table/column when the description says so
+// ("table users", "column email") or the indexed schema has it. Otherwise
+// "rename positiveInt" or "split into modules" would read as schema changes.
+function parseChangeDescription(change, schema) {
   const lower = change.toLowerCase();
   const words = change.replace(/[^\w\s]/g, ' ').split(/\s+/).filter(Boolean);
+  const paths = change.match(/[\w.-]+(?:\/[\w.-]+)+|[\w-]+\.(?:js|mjs|cjs|ts|tsx|jsx|vue|php|py|go|rs|java|dart)\b/g) || [];
 
-  const tablePatterns = [
-    /(?:table|from|join|into)\s+[`"']?(\w+)[`"']?/gi,
-    /(\w+)(?:_table|Table)\b/g,
-  ];
-  const tableNames = [];
-  for (const pat of tablePatterns) {
-    let m;
-    while ((m = pat.exec(change)) !== null) {
-      tableNames.push(m[1].toLowerCase());
-    }
-  }
+  const explicitTables = matchAll(change, [/\btable\s+[`"']?(\w+)[`"']?/gi, /(\w+)_table\b/g]);
+  const impliedTables = matchAll(change, [/\b(?:from|join|into|to|on|in)\s+[`"']?(\w+)[`"']?/gi]);
+  const tableNames = [...explicitTables, ...impliedTables.filter(t => schema.tables.has(t))];
 
-  const columnPatterns = [
-    /(?:column|field|add|drop|rename)\s+[`"']?(\w+)[`"']?/gi,
+  const explicitColumns = matchAll(change, [
+    /\b(?:column|field)\s+[`"']?(\w+)[`"']?/gi,
+    /[`"']?(\w+)[`"']?\s+(?:column|field)\b/gi,
     /\.(\w+)\s*(?:=|!=|<|>|IS)/gi,
-  ];
-  const columnNames = [];
-  for (const pat of columnPatterns) {
-    let m;
-    while ((m = pat.exec(change)) !== null) {
-      columnNames.push(m[1].toLowerCase());
-    }
-  }
+  ]).filter(c => !IMPACT_STOP_WORDS.has(c));
+  const verbTargets = matchAll(change, [/\b(?:add|drop|rename|remove)\s+[`"']?(\w+)[`"']?/gi]);
+  const columnNames = [...explicitColumns, ...verbTargets.filter(c => schema.columns.has(c))];
 
   const classPatterns = [
     /(?:class|model|entity|controller|service)\s+(\w+)/gi,
@@ -164,9 +201,16 @@ function parseChangeDescription(change) {
 
   const isRemoval = /\b(remove|drop|delete)\b/i.test(lower);
   const isRename = /\brename\b/i.test(lower);
+  const isSignatureChange = /\b(signature|parameters?|params?|arguments?|return type|make (?:it )?(?:required|optional))\b/i.test(lower);
+
+  // `UserService::find`, `GraphStore.locate`, `$repo->save` name one member.
+  const members = [...change.matchAll(/([A-Za-z_\\][\w\\]*)(?:::|->|\.|#)([A-Za-z_]\w*)\b/g)]
+    .filter(m => !/^(js|ts|tsx|jsx|php|py|go|rs|java|dart|vue|mjs|cjs)$/i.test(m[2]))
+    .map(m => ({ owner: m[1].replace(/^\$/, '').split('\\').pop(), member: m[2] }));
 
   return {
     words,
+    paths,
     tableNames: [...new Set(tableNames)],
     columnNames: [...new Set(columnNames)],
     classNames: [...new Set(classNames)],
@@ -174,6 +218,8 @@ function parseChangeDescription(change) {
     isReadOnly,
     isRemoval,
     isRename,
+    isSignatureChange,
+    members,
   };
 }
 
@@ -188,6 +234,14 @@ function findSeedNodes(store, subId, tokens) {
         seeds.push(n);
       }
     }
+  }
+
+  for (const { owner, member } of tokens.members) {
+    const lowerOwner = owner.toLowerCase();
+    addUnique(store.findMembersByName(subId, member, 'method').filter((n) => {
+      const ownerShort = n.symbol.slice(0, Math.max(n.symbol.lastIndexOf('::'), n.symbol.lastIndexOf('.'))).split(/[\\.]/).pop().toLowerCase();
+      return ownerShort === lowerOwner || ownerShort.endsWith(lowerOwner);
+    }));
   }
 
   for (const table of tokens.tableNames) {
@@ -209,10 +263,17 @@ function findSeedNodes(store, subId, tokens) {
       .filter((n) => n.symbol.includes(rp)));
   }
 
+  // Identifiers named in the description that exist verbatim win over fuzzy matches.
   if (seeds.length === 0) {
-    const allNodes = store.findNodes({ subprojectId: subId });
     for (const word of tokens.words) {
-      if (word.length < 3) continue;
+      if (word.length >= 3) addUnique(store.locate(subId, word).filter((n) => n.symbol === word || n.symbol.endsWith(`.${word}`) || n.symbol.endsWith(`::${word}`)));
+    }
+  }
+
+  if (seeds.length === 0) {
+    const allNodes = store.findNodes({ subprojectId: subId }).filter((n) => n.kind !== 'doc_section');
+    for (const word of tokens.words) {
+      if (word.length < 3 || IMPACT_STOP_WORDS.has(word.toLowerCase())) continue;
       const lower = word.toLowerCase();
       const matches = allNodes.filter(
         (n) => n.symbol.toLowerCase().includes(lower)
@@ -221,8 +282,20 @@ function findSeedNodes(store, subId, tokens) {
     }
   }
 
+  // A path in the description ("... in src/utils/env.js") narrows the seeds.
+  if (tokens.paths.length > 0) {
+    const inPath = seeds.filter((n) => tokens.paths.some((p) => n.path === p || n.path.endsWith(`/${p}`) || n.path.startsWith(`${p}/`)));
+    if (inPath.length > 0) return inPath;
+  }
+
   return seeds;
 }
+
+const IMPACT_STOP_WORDS = new Set([
+  'a', 'an', 'to', 'on', 'in', 'of', 'at', 'by', 'is', 'as',
+  'add', 'the', 'and', 'for', 'from', 'into', 'with', 'rename', 'remove', 'drop', 'delete', 'change',
+  'update', 'modify', 'create', 'new', 'src', 'lib', 'app', 'file', 'function', 'method', 'class',
+]);
 
 function findHardcodedChecks(affected, tokens) {
   const checks = [];
@@ -262,6 +335,7 @@ function findHardcodedChecks(affected, tokens) {
 function determineBreaking(seedNodes, affected, tokens) {
   if (tokens.isRemoval) return true;
   if (tokens.isRename) return true;
+  if (tokens.isSignatureChange && affected.length > 0) return true;
 
   const hasPublicApi = seedNodes.some(
     (n) => (n.kind === 'route' || n.kind === 'api_endpoint') && n.exported

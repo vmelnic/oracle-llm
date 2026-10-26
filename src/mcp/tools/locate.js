@@ -44,6 +44,14 @@ export function locate(ctx, { symbol, kind }) {
     kind: d.kind,
   }));
 
+  if (definitions.length === 0) {
+    return {
+      answer: { found: false, definitions: [], references_count: 0, message: `No symbol matching '${symbol}'${kind ? ` of kind ${kind}` : ''} in this subproject` },
+      evidence: [],
+      layer: 'L1',
+    };
+  }
+
   return {
     answer: { definitions, references_count: totalRefs },
     evidence,

@@ -7,6 +7,11 @@ const rawHome = process.env.ORACLE_HOME || path.join(os.homedir(), '.oracle');
 const ORACLE_HOME = rawHome.startsWith('~') ? path.join(os.homedir(), rawHome.slice(1)) : rawHome;
 const WORKSPACES_DIR = path.join(ORACLE_HOME, 'workspaces');
 
+/** Root of all oracle data (ORACLE_HOME, default ~/.oracle; `~` expanded). */
+export function getOracleHome() {
+  return ORACLE_HOME;
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true, mode: 0o700 });
   try { fs.chmodSync(dirPath, 0o700); } catch {}
@@ -34,7 +39,7 @@ export function saveWorkspace(workspace) {
         workspace.id = `${workspace.id}-${suffix}`;
       }
     } catch (err) {
-      throw new Error(`Refusing to overwrite unreadable workspace metadata: ${err.message}`);
+      throw new Error(`Refusing to overwrite unreadable workspace metadata: ${err.message}`, { cause: err });
     }
   }
   const dir = getOracleDir(workspace.id);

@@ -5,37 +5,14 @@ import Database from 'better-sqlite3';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { loadWorkspace, getSubprojectDir } from '../../scanner/workspace.js';
+import { getSubprojectDir } from '../../scanner/workspace.js';
+import { requireSubproject } from '../resolve.js';
 import { acquireFileLock } from '../../utils/file-lock.js';
 import { markIngestState } from '../../ingest/state.js';
+import { applyMigrations } from '../../graph/migrations.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const SCHEMA_PATH = join(__dirname, '..', '..', 'graph', 'schema.sql');
-
-const CURRENT_VERSION = 2;
-
-const MIGRATIONS = [
-  {
-    version: 1,
-    description: 'Initial schema',
-    up(db) {
-      const sql = readFileSync(SCHEMA_PATH, 'utf-8');
-      db.exec(sql);
-    },
-  },
-  {
-    version: 2,
-    description: 'Add schema_version tracking',
-    up(db) {
-      db.exec(`
-        CREATE TABLE IF NOT EXISTS schema_version (
-          version INTEGER NOT NULL,
-          applied_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-      `);
-    },
-  },
-];
 
 function getDbPath(workspaceId, subprojectId) {
   const dir = getSubprojectDir(workspaceId, subprojectId);
@@ -46,34 +23,6 @@ function schemaSql() {
   return readFileSync(SCHEMA_PATH, 'utf-8');
 }
 
-function getSchemaVersion(db) {
-  try {
-    const row = db.prepare('SELECT MAX(version) as v FROM schema_version').get();
-    return row?.v || 0;
-  } catch {
-    return 0;
-  }
-}
-
-function applyMigrations(db) {
-  const current = getSchemaVersion(db);
-  const applyMigration = db.transaction((migration) => {
-    migration.up(db);
-    if (getSchemaVersion(db) < migration.version) {
-      db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(migration.version);
-    }
-  });
-
-  let applied = 0;
-  for (const migration of MIGRATIONS) {
-    if (migration.version <= getSchemaVersion(db)) continue;
-    applyMigration(migration);
-    applied++;
-  }
-
-  return { current, applied, newVersion: getSchemaVersion(db) };
-}
-
 export function dbCommand() {
   const cmd = new Command('db');
   cmd.description('Database management');
@@ -82,17 +31,7 @@ export function dbCommand() {
     .command('migrate <workspace_id> <subproject_id>')
     .description('Apply or update the SQL schema for a subproject database')
     .action((workspaceId, subprojectId) => {
-      const workspace = loadWorkspace(workspaceId);
-      if (!workspace) {
-        console.error(`Workspace '${workspaceId}' not found.`);
-        process.exit(1);
-      }
-
-      const sp = workspace.subprojects.find((s) => s.id === subprojectId);
-      if (!sp) {
-        console.error(`Subproject '${subprojectId}' not found.`);
-        process.exit(1);
-      }
+      requireSubproject(workspaceId, subprojectId);
 
       const dbPath = getDbPath(workspaceId, subprojectId);
       fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -103,7 +42,7 @@ export function dbCommand() {
         db = new Database(dbPath);
         const result = applyMigrations(db);
         if (result.applied === 0) {
-          console.log(`Schema up to date (version ${result.current}): ${dbPath}`);
+          console.log(`Schema up to date (version ${result.newVersion}): ${dbPath}`);
         } else {
           console.log(`Applied ${result.applied} migration(s) (v${result.current} → v${result.newVersion}): ${dbPath}`);
         }
@@ -119,17 +58,7 @@ export function dbCommand() {
     .option('--keep-artifacts', 'Keep generated L2, pattern, and contract artifacts')
     .option('--no-backup', 'Do not keep a timestamped backup of the database')
     .action(async (workspaceId, subprojectId, opts) => {
-      const workspace = loadWorkspace(workspaceId);
-      if (!workspace) {
-        console.error(`Workspace '${workspaceId}' not found.`);
-        process.exit(1);
-      }
-
-      const sp = workspace.subprojects.find((s) => s.id === subprojectId);
-      if (!sp) {
-        console.error(`Subproject '${subprojectId}' not found.`);
-        process.exit(1);
-      }
+      requireSubproject(workspaceId, subprojectId);
 
       const dbPath = getDbPath(workspaceId, subprojectId);
       if (!fs.existsSync(dbPath)) {
@@ -198,6 +127,7 @@ export function dbCommand() {
     .command('path <workspace_id> <subproject_id>')
     .description('Print the database file path')
     .action((workspaceId, subprojectId) => {
+      requireSubproject(workspaceId, subprojectId);
       console.log(getDbPath(workspaceId, subprojectId));
     });
 

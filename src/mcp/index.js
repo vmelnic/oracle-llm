@@ -14,7 +14,8 @@ import { ManifestDrafter } from '../manifest/index.js';
 import { L2Index } from '../retrieval/index.js';
 import { createParser } from '../parser/index.js';
 import { loadWorkspace, getSubprojectDir } from '../scanner/workspace.js';
-import { L3InferenceEngine } from '../l3/inference.js';
+import { createL3Engine } from '../l3/config.js';
+import { synthesizeWithL3 } from '../l3/synthesize.js';
 import { WeightsThenPatch } from '../l3/weights-patch.js';
 import { FileWatcher } from '../watcher/index.js';
 import { toToon } from '../grounding/toon.js';
@@ -44,308 +45,12 @@ import {
 import path from 'path';
 import fs from 'fs';
 import { randomUUID, timingSafeEqual } from 'node:crypto';
+import { VERSION } from '../version.js';
+import { positiveInt } from '../utils/env.js';
 
-const TOOL_DEFS = [
-  {
-    name: 'oracle.locate',
-    description: 'Find definitions of a symbol. Returns definitions[] and references_count.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        symbol: { type: 'string', description: 'Symbol name to find' },
-        kind: { type: 'string', description: 'Optional kind filter (function, class, method, route, component, etc.)' },
-      },
-      required: ['workspace_id', 'subproject_id', 'symbol'],
-    },
-  },
-  {
-    name: 'oracle.signature',
-    description: 'Get the signature, type info, and doc for a symbol or location.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        path: { type: 'string', description: 'File path (relative to subproject root)' },
-        line: { type: 'number', description: 'Line number' },
-        symbol: { type: 'string', description: 'Symbol name (alternative to path+line)' },
-      },
-      required: ['workspace_id', 'subproject_id'],
-    },
-  },
-  {
-    name: 'oracle.exists',
-    description: 'Search for something by description. Returns whether it exists and candidates.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        description: { type: 'string', description: 'What to search for' },
-      },
-      required: ['workspace_id', 'subproject_id', 'description'],
-    },
-  },
-  {
-    name: 'oracle.nearby',
-    description: 'Find symbols near a location in a file, ranked by proximity and intent.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        path: { type: 'string' },
-        line: { type: 'number' },
-        intent: { type: 'string', description: 'What you are looking for' },
-      },
-      required: ['workspace_id', 'subproject_id', 'path', 'line'],
-    },
-  },
-  {
-    name: 'oracle.consumers',
-    description: 'Find all consumers of a symbol (transitive, BFS).',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        target: { type: 'string', description: 'Symbol name or node ID' },
-        kind: { type: 'string', description: 'Optional kind filter' },
-      },
-      required: ['workspace_id', 'subproject_id', 'target'],
-    },
-  },
-  {
-    name: 'oracle.diff_since',
-    description: 'Show changed files and symbols since a git ref.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        ref: { type: 'string', description: 'Git ref (commit, branch, tag)' },
-        scope: { type: 'string', description: 'Optional scope filter' },
-      },
-      required: ['workspace_id', 'subproject_id', 'ref'],
-    },
-  },
-  {
-    name: 'oracle.conventions_for',
-    description: 'Get conventions for a topic: patterns, canonical examples, manifest rules.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        topic: { type: 'string', description: 'Topic: migrations, auth, validation, errors, routing, state, etc.' },
-      },
-      required: ['workspace_id', 'subproject_id', 'topic'],
-    },
-  },
-  {
-    name: 'oracle.where_would',
-    description: 'Suggest where new code should be placed based on existing structure.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        intent: { type: 'string', description: 'What you want to create, e.g. "therapist registration API"' },
-      },
-      required: ['workspace_id', 'subproject_id', 'intent'],
-    },
-  },
-  {
-    name: 'oracle.pattern',
-    description: 'Look up a named pattern from the catalogue.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        name: { type: 'string', description: 'Pattern name or kind' },
-        context: { type: 'string', description: 'Optional context for relevance ranking' },
-      },
-      required: ['workspace_id', 'subproject_id', 'name'],
-    },
-  },
-  {
-    name: 'oracle.impact',
-    description: 'Analyze impact of a proposed change. Returns breaking status, affected routes/components, migration needs.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        change: { type: 'string', description: 'Description of the change, e.g. "add status column to therapist_profiles"' },
-      },
-      required: ['workspace_id', 'subproject_id', 'change'],
-    },
-  },
-  {
-    name: 'oracle.validate',
-    description: 'Validate proposed code against conventions and patterns.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        path: { type: 'string', description: 'File path for the proposed code' },
-        proposed_code: { type: 'string', description: 'The code to validate' },
-      },
-      required: ['workspace_id', 'subproject_id', 'path', 'proposed_code'],
-    },
-  },
-  {
-    name: 'oracle.context',
-    description: 'Bundled discovery — the primary tool. Returns full task packet: existing files, suggested creates/modifies, DB schema, patterns, conventions, relevant code.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        task: { type: 'string', description: 'Task description, e.g. "Add therapist registration"' },
-      },
-      required: ['workspace_id', 'subproject_id', 'task'],
-    },
-  },
-  {
-    name: 'oracle.read_exact',
-    description: 'Read exact lines from a file. The only way to get verbatim code.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        path: { type: 'string', description: 'File path (relative to subproject root)' },
-        line_range: {
-          type: 'array',
-          items: { type: 'number' },
-          minItems: 2,
-          maxItems: 2,
-          description: '[start_line, end_line]',
-        },
-      },
-      required: ['workspace_id', 'subproject_id', 'path', 'line_range'],
-    },
-  },
-  {
-    name: 'oracle.stats',
-    description: 'Get node/edge counts by kind for debugging.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-      },
-      required: ['workspace_id', 'subproject_id'],
-    },
-  },
-  {
-    name: 'oracle.ingest',
-    description: 'Ingest (build/rebuild) entity graph, patterns, manifest, contracts, L2 index, and markdown docs for a workspace or subproject.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string', description: 'Optional — ingests all subprojects if omitted' },
-        embeddings: { type: 'boolean', description: 'Enable semantic embeddings (default: env ORACLE_EMBEDDINGS)' },
-      },
-      required: ['workspace_id'],
-    },
-  },
-  {
-    name: 'oracle.workspace_add',
-    description: 'Register a new workspace by scanning a directory for subprojects.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: 'Absolute path to project root' },
-      },
-      required: ['path'],
-    },
-  },
-  {
-    name: 'oracle.workspace_scan',
-    description: 'Re-scan an existing workspace to detect new or removed subprojects.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-      },
-      required: ['workspace_id'],
-    },
-  },
-  {
-    name: 'oracle.workspace_list',
-    description: 'List all registered workspaces and their subprojects.',
-    inputSchema: {
-      type: 'object',
-      properties: {},
-    },
-  },
-  {
-    name: 'oracle.status',
-    description: 'Show layer status (L1/L2/L3), node/edge counts for workspaces and subprojects.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string', description: 'Optional — shows all workspaces if omitted' },
-      },
-    },
-  },
-  {
-    name: 'oracle.gate',
-    description: 'Run emit gate (pre-commit validation) on a proposed diff. Checks: parse errors, conventions, impact, tests.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-        diff: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              path: { type: 'string' },
-              content: { type: 'string' },
-              action: { type: 'string', enum: ['add', 'modify', 'delete'] },
-              deleted: { type: 'boolean' },
-            },
-          },
-          description: 'Array of {path, content} objects representing the proposed changes',
-        },
-      },
-      required: ['workspace_id', 'subproject_id', 'diff'],
-    },
-  },
-  {
-    name: 'oracle.manifest_show',
-    description: 'Show the manifest (framework, conventions, migrations, tests, etc.) for a subproject.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-      },
-      required: ['workspace_id', 'subproject_id'],
-    },
-  },
-  {
-    name: 'oracle.patterns_list',
-    description: 'List all patterns in the pattern catalogue for a subproject.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        workspace_id: { type: 'string' },
-        subproject_id: { type: 'string' },
-      },
-      required: ['workspace_id', 'subproject_id'],
-    },
-  },
-];
+// Tool names, descriptions and input schemas (the text MCP clients show their
+// model) live in prompts/mcp/tools.json, not in code.
+const TOOL_DEFS = JSON.parse(fs.readFileSync(new URL('../../prompts/mcp/tools.json', import.meta.url), 'utf-8'));
 
 const ADMIN_HANDLERS = {
   'oracle.ingest': adminIngest,
@@ -410,29 +115,44 @@ class SimpleLruMap extends Map {
   }
 }
 
-function evictResources(key, cachedStore) {
-  const store = cachedStore || Map.prototype.get.call(openStores, key);
-  if (store) { try { store.close(); } catch {} }
-  openPatterns.delete(key);
-  loadedManifests.delete(key);
-  openL2.delete(key);
-  loadedL3.delete(key);
-  loadedStateVersions.delete(key);
-  lastAccessed.delete(key);
-  const watcher = activeWatchers.get(key);
-  if (watcher) {
-    try { watcher.stop(); } catch {}
-    activeWatchers.delete(key);
+// Per-subproject resources. Reference-counted so a bundle that is evicted or
+// superseded by a newer ingest is closed only after the last in-flight
+// request using it has finished.
+class ResourceBundle {
+  constructor(store, version) {
+    this.store = store;
+    this.version = version;
+    this.patterns = null;
+    this.manifest = null;
+    this.l2 = null;
+    this.l3 = null;
+    this.refs = 0;
+    this.retired = false;
+    this.lastAccessed = Date.now();
+  }
+
+  acquire() {
+    this.refs++;
+    this.lastAccessed = Date.now();
+  }
+
+  release() {
+    this.refs--;
+    if (this.retired && this.refs <= 0) this._close();
+  }
+
+  retire() {
+    this.retired = true;
+    if (this.refs <= 0) this._close();
+  }
+
+  _close() {
+    try { this.store.close(); } catch {}
   }
 }
 
-const openStores = new SimpleLruMap(MAX_CACHE_SIZE, evictResources);
-const openPatterns = new Map();
-const loadedManifests = new Map();
-const openL2 = new Map();
-const loadedL3 = new Map();
-const loadedStateVersions = new Map();
-const lastAccessed = new Map();
+const openBundles = new SimpleLruMap(MAX_CACHE_SIZE, (_key, bundle) => bundle?.retire());
+// Watchers keep their own store and outlive cache eviction; they stop only on shutdown.
 const activeWatchers = new Map();
 let idleTimer = null;
 let idleTimeoutMs = 0;
@@ -446,17 +166,11 @@ function getParser() {
   return sharedParser;
 }
 
-function touch(storeKey) {
-  lastAccessed.set(storeKey, Date.now());
-}
-
 function closeIdleResources() {
   if (idleTimeoutMs <= 0) return;
   const cutoff = Date.now() - idleTimeoutMs;
-  for (const [storeKey, ts] of lastAccessed) {
-    if (ts < cutoff) {
-      openStores.delete(storeKey);
-    }
+  for (const [storeKey, bundle] of [...openBundles]) {
+    if (bundle.lastAccessed < cutoff && bundle.refs === 0) openBundles.delete(storeKey);
   }
 }
 
@@ -467,18 +181,64 @@ function startIdleTimer() {
   }
 }
 
-function getContext(workspaceId, subprojectId) {
+function getContext(workspaceId, subprojectId, { allowedRoots = [] } = {}) {
   const workspace = loadWorkspace(workspaceId);
   if (!workspace) throw new Error(`Workspace '${workspaceId}' not found`);
+  if (allowedRoots.length > 0 && !isRootAllowed(workspace.root, allowedRoots)) {
+    throw new Error(`Workspace '${workspaceId}' is outside ORACLE_ALLOWED_ROOTS`);
+  }
 
   const subproject = workspace.subprojects.find(s => s.id === subprojectId);
   if (!subproject) throw new Error(`Subproject '${subprojectId}' not found in workspace '${workspaceId}'`);
+  if (allowedRoots.length > 0 && !isRootAllowed(subproject.root, allowedRoots)) {
+    throw new Error(`Subproject '${subprojectId}' is outside ORACLE_ALLOWED_ROOTS`);
+  }
 
   const storeKey = `${workspaceId}/${subprojectId}`;
   const resourceDir = getSubprojectDir(workspaceId, subprojectId);
+  let bundle = openBundles.get(storeKey);
   if (fs.existsSync(path.join(resourceDir, '.ingest.lock'))) {
-    throw new Error(`Subproject '${storeKey}' is being reindexed; retry shortly`);
+    // Keep serving the last complete build while a reindex runs. Opening a
+    // fresh store mid-build would contend for the write lock, so without a
+    // cached bundle the caller has to wait.
+    if (!bundle) throw new Error(`Subproject '${storeKey}' is being reindexed; retry shortly`);
+  } else {
+    bundle = refreshBundle(storeKey, resourceDir, bundle);
   }
+  if (watchEnabled && !activeWatchers.has(storeKey)) startWatcher(storeKey, workspace, subproject);
+
+  // Build everything that can throw first; acquire last, so a failure here
+  // never leaves the bundle with a reference nobody will release.
+  const grounding = new GroundingWrapper(bundle.store, {
+    parser: getParser(),
+    subprojectRoot: subproject.root,
+  });
+  const weightsPatch = new WeightsThenPatch(bundle.store, bundle.patterns, bundle.manifest);
+  bundle.acquire();
+
+  let released = false;
+  return {
+    store: bundle.store,
+    subproject,
+    grounding,
+    workspace,
+    patterns: bundle.patterns,
+    manifest: bundle.manifest,
+    l2: bundle.l2,
+    l3: bundle.l3,
+    weightsPatch,
+    allowedRoots,
+    release() {
+      if (released) return;
+      released = true;
+      bundle.release();
+    },
+  };
+}
+
+// Returns the cached bundle if it matches the current ingest version,
+// otherwise retires it and opens a new one.
+function refreshBundle(storeKey, resourceDir, bundle) {
   const ingestStatePath = path.join(resourceDir, 'ingest_state.json');
   let ingestVersion = null;
   if (fs.existsSync(ingestStatePath)) {
@@ -490,82 +250,53 @@ function getContext(workspaceId, subprojectId) {
       }
     } catch (err) {
       if (err.message.includes('not ready')) throw err;
-      throw new Error(`Subproject '${storeKey}' has an unreadable ingest state`);
+      throw new Error(`Subproject '${storeKey}' has an unreadable ingest state`, { cause: err });
     }
   }
-  if (openStores.has(storeKey) && loadedStateVersions.get(storeKey) !== ingestVersion) {
-    openStores.delete(storeKey);
-  }
-  touch(storeKey);
 
-  if (!openStores.has(storeKey)) {
-    const dir = resourceDir;
-    const dbPath = path.join(dir, 'entity_graph.sqlite');
-    if (!fs.existsSync(dbPath)) throw new Error(`Entity graph not built for ${storeKey}. Run 'oracle ingest' first.`);
-    openStores.set(storeKey, new GraphStore(dbPath));
-    loadedStateVersions.set(storeKey, ingestVersion);
-  }
+  if (bundle && bundle.version === ingestVersion) return bundle;
+  if (bundle) openBundles.delete(storeKey);
+  return openBundle(storeKey, resourceDir, ingestVersion);
+}
 
-  if (!openPatterns.has(storeKey)) {
-    const dir = getSubprojectDir(workspaceId, subprojectId);
-    const catalogue = new PatternCatalogue(openStores.get(storeKey));
+function openBundle(storeKey, dir, ingestVersion) {
+  const dbPath = path.join(dir, 'entity_graph.sqlite');
+  if (!fs.existsSync(dbPath)) throw new Error(`Entity graph not built for ${storeKey}. Run 'oracle ingest' first.`);
+  const bundle = new ResourceBundle(new GraphStore(dbPath), ingestVersion);
+  try {
+    bundle.patterns = new PatternCatalogue(bundle.store);
     const cataloguePath = path.join(dir, 'pattern_catalog.json');
-    if (fs.existsSync(cataloguePath)) catalogue.load(cataloguePath);
-    openPatterns.set(storeKey, catalogue);
-  }
+    if (fs.existsSync(cataloguePath)) bundle.patterns.load(cataloguePath);
 
-  if (!loadedManifests.has(storeKey)) {
-    const dir = getSubprojectDir(workspaceId, subprojectId);
-    const manifestPath = path.join(dir, 'manifest.yaml');
-    const drafter = new ManifestDrafter();
-    loadedManifests.set(storeKey, drafter.load(manifestPath) || {});
-  }
+    bundle.manifest = new ManifestDrafter().load(path.join(dir, 'manifest.yaml')) || {};
 
-  if (!openL2.has(storeKey)) {
-    const dir = getSubprojectDir(workspaceId, subprojectId);
-    const l2 = new L2Index(openStores.get(storeKey), { indexPath: path.join(dir, 'ast_embed_index.json') });
-    l2.load();
-    openL2.set(storeKey, l2);
-  }
+    bundle.l2 = new L2Index(bundle.store, { indexPath: path.join(dir, 'ast_embed_index') });
+    bundle.l2.load();
 
-  if (!loadedL3.has(storeKey)) {
-    const l3Enabled = process.env.ORACLE_L3_ENABLED === 'true';
-    if (l3Enabled && process.env.ORACLE_L3_BASE_URL) {
-      loadedL3.set(storeKey, new L3InferenceEngine({
-        baseUrl: process.env.ORACLE_L3_BASE_URL,
-        model: process.env.ORACLE_L3_MODEL || 'default',
-        apiKey: process.env.ORACLE_L3_API_KEY,
-      }));
-    }
+    bundle.l3 = createL3Engine();
+  } catch (err) {
+    bundle.retire();
+    throw err;
   }
+  openBundles.set(storeKey, bundle);
+  return bundle;
+}
 
-  if (watchEnabled && !activeWatchers.has(storeKey)) {
-    try {
-      const watcher = new FileWatcher({ workspace, subproject });
-      watcher.onReindex = (stats) => {
-        console.error(`[watch] ${storeKey} reindexed: ${JSON.stringify(stats)}`);
-      };
-      watcher.start();
-      activeWatchers.set(storeKey, watcher);
-    } catch (err) {
+function startWatcher(storeKey, workspace, subproject) {
+  try {
+    const watcher = new FileWatcher({ workspace, subproject });
+    watcher.onReindex = (stats) => {
+      console.error(`[watch] ${storeKey} reindexed: ${JSON.stringify(stats)}`);
+    };
+    activeWatchers.set(storeKey, watcher);
+    watcher.start().catch((err) => {
       console.error(`[watch] failed to start watcher for ${storeKey}: ${err.message}`);
-    }
+      watcher.stop();
+      activeWatchers.delete(storeKey);
+    });
+  } catch (err) {
+    console.error(`[watch] failed to start watcher for ${storeKey}: ${err.message}`);
   }
-
-  return {
-    store: openStores.get(storeKey),
-    subproject,
-    grounding: new GroundingWrapper(openStores.get(storeKey), {
-      parser: getParser(),
-      subprojectRoot: subproject.root,
-    }),
-    workspace,
-    patterns: openPatterns.get(storeKey),
-    manifest: loadedManifests.get(storeKey),
-    l2: openL2.get(storeKey),
-    l3: loadedL3.get(storeKey) || null,
-    weightsPatch: new WeightsThenPatch(openStores.get(storeKey), openPatterns.get(storeKey), loadedManifests.get(storeKey)),
-  };
 }
 
 function enrichEvidence(raw, workspaceId, subprojectId, subproject) {
@@ -584,38 +315,63 @@ function enrichEvidence(raw, workspaceId, subprojectId, subproject) {
   };
 }
 
-function checkCrossSubproject(workspace, workspaceId, currentSubprojectId, toolArgs, toolName) {
-  if (!workspace?.subprojects || workspace.subprojects.length <= 1) return null;
+const CROSS_SUBPROJECT_REROUTE_TOOLS = new Set([
+  'oracle.locate', 'oracle.exists', 'oracle.consumers',
+  'oracle.signature', 'oracle.nearby', 'oracle.pattern',
+]);
+const CROSS_SUBPROJECT_HINT_TOOLS = new Set([
+  ...CROSS_SUBPROJECT_REROUTE_TOOLS, 'oracle.context', 'oracle.conventions_for',
+]);
 
-  const searchTools = new Set([
-    'oracle.locate', 'oracle.exists', 'oracle.consumers',
-    'oracle.signature', 'oracle.nearby', 'oracle.pattern',
-  ]);
-  if (!searchTools.has(toolName)) return null;
+// Sibling stores used only for cross-subproject symbol hints, keyed by DB path
+// and reopened when the sibling's ingest version changes.
+const siblingStores = new SimpleLruMap(32, (_key, entry) => {
+  try { entry?.store.close(); } catch {}
+});
+
+function readIngestVersion(dir) {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(dir, 'ingest_state.json'), 'utf-8')).updated_at || null;
+  } catch {
+    return null;
+  }
+}
+
+function getSiblingStore(workspaceId, subprojectId) {
+  const dir = getSubprojectDir(workspaceId, subprojectId);
+  const dbPath = path.join(dir, 'entity_graph.sqlite');
+  if (!fs.existsSync(dbPath) || fs.existsSync(path.join(dir, '.ingest.lock'))) return null;
+  const version = readIngestVersion(dir);
+  const cached = siblingStores.get(dbPath);
+  if (cached && cached.version === version) return cached.store;
+  if (cached) siblingStores.delete(dbPath);
+  const store = new GraphStore(dbPath);
+  siblingStores.set(dbPath, { store, version });
+  return store;
+}
+
+function findSiblingSubprojects(ctx, workspaceId, currentSubprojectId, toolArgs, toolName) {
+  const { workspace, allowedRoots } = ctx;
+  if (!workspace?.subprojects || workspace.subprojects.length <= 1) return [];
+  if (!CROSS_SUBPROJECT_HINT_TOOLS.has(toolName)) return [];
 
   const searchTerm = toolArgs.symbol || toolArgs.description || toolArgs.target
-    || toolArgs.name || toolArgs.intent || '';
-  if (!searchTerm || searchTerm.length < 2) return null;
+    || toolArgs.name || toolArgs.intent || toolArgs.task || '';
+  if (!searchTerm || searchTerm.length < 2) return [];
 
   const siblingIds = [];
   for (const sp of workspace.subprojects) {
     if (sp.id === currentSubprojectId) continue;
+    if (allowedRoots.length > 0 && !isRootAllowed(sp.root, allowedRoots)) continue;
     try {
-      const dir = getSubprojectDir(workspaceId, sp.id);
-      const dbPath = path.join(dir, 'entity_graph.sqlite');
-      if (!fs.existsSync(dbPath)) continue;
-      const siblingStore = new GraphStore(dbPath);
-      try {
-        const found = siblingStore.locate(sp.id, searchTerm);
-        if (found.length > 0) siblingIds.push(sp.id);
-      } finally {
-        siblingStore.close();
-      }
+      const store = getSiblingStore(workspaceId, sp.id);
+      if (store && store.locate(sp.id, searchTerm).length > 0) siblingIds.push(sp.id);
     } catch {}
   }
+  return siblingIds;
+}
 
-  if (siblingIds.length === 0) return null;
-
+function rerouteResponse(siblingIds, searchTerm, currentSubprojectId) {
   return {
     content: [{
       type: 'text',
@@ -631,91 +387,27 @@ function checkCrossSubproject(workspace, workspaceId, currentSubprojectId, toolA
   };
 }
 
-function checkCrossSubprojectHint(workspace, workspaceId, currentSubprojectId, toolArgs, toolName) {
-  if (!workspace?.subprojects || workspace.subprojects.length <= 1) return null;
-
-  const hintTools = new Set([
-    'oracle.locate', 'oracle.exists', 'oracle.consumers',
-    'oracle.signature', 'oracle.nearby', 'oracle.pattern',
-    'oracle.context', 'oracle.conventions_for',
-  ]);
-  if (!hintTools.has(toolName)) return null;
-
-  const searchTerm = toolArgs.symbol || toolArgs.description || toolArgs.target
-    || toolArgs.name || toolArgs.intent || toolArgs.task || '';
-  if (!searchTerm || searchTerm.length < 2) return null;
-
-  const siblingIds = [];
-  for (const sp of workspace.subprojects) {
-    if (sp.id === currentSubprojectId) continue;
-    try {
-      const dir = getSubprojectDir(workspaceId, sp.id);
-      const dbPath = path.join(dir, 'entity_graph.sqlite');
-      if (!fs.existsSync(dbPath)) continue;
-      const siblingStore = new GraphStore(dbPath);
-      try {
-        const found = siblingStore.locate(sp.id, searchTerm);
-        if (found.length > 0) siblingIds.push(sp.id);
-      } finally {
-        siblingStore.close();
-      }
-    } catch {}
-  }
-
-  if (siblingIds.length === 0) return null;
-  return siblingIds;
-}
-
-function buildL1Context(l1Result, ctx) {
-  const parts = [];
-
-  if (l1Result.evidence && l1Result.evidence.length > 0) {
-    for (const e of l1Result.evidence) {
-      const loc = e.line_range ? `:${e.line_range[0]}-${e.line_range[1]}` : '';
-      const kind = e.kind ? ` (${e.kind})` : '';
-      parts.push(`- ${e.symbol || e.path}${kind}, ${e.path}${loc}`);
-    }
-  }
-
-  if (l1Result.answer) {
-    const a = l1Result.answer;
-    if (a.existing_files) {
-      for (const f of a.existing_files) {
-        const symbols = f.symbols?.map(s => s.name || s).join(', ') || '';
-        parts.push(`- file: ${f.path}${symbols ? ' — ' + symbols : ''}`);
-      }
-    }
-    if (a.patterns) {
-      for (const p of a.patterns) {
-        parts.push(`- pattern: ${p.name || p.kind} — ${p.summary || ''}`);
-      }
-    }
-    if (a.conventions) {
-      for (const c of a.conventions) {
-        parts.push(`- convention: ${c}`);
-      }
-    }
-  }
-
-  return parts.join('\n');
-}
-
 const FACTUAL_TOOLS = new Set([
   'oracle.locate', 'oracle.signature', 'oracle.exists',
   'oracle.consumers', 'oracle.impact', 'oracle.validate',
 ]);
 
-export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } = {}) {
+// oracle.gate runs the project's type-checker and tests against client-supplied
+// code, so on shared transports it needs its own opt-in on top of admin tools.
+const CODE_EXECUTING_TOOLS = new Set(['oracle.gate']);
+
+export async function createMcpServer({ allowAdmin = true, allowGate = allowAdmin, allowedRoots = [] } = {}) {
   const server = new Server(
-    { name: 'llm-oracle', version: '0.1.0' },
+    { name: 'llm-oracle', version: VERSION },
     { capabilities: { tools: {} } }
   );
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: allowAdmin ? TOOL_DEFS : TOOL_DEFS.filter(tool => !ADMIN_HANDLERS[tool.name]),
+    tools: TOOL_DEFS.filter(tool => (allowAdmin || !ADMIN_HANDLERS[tool.name])
+      && (allowGate || !CODE_EXECUTING_TOOLS.has(tool.name))),
   }));
 
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: args } = request.params;
 
     const adminHandler = ADMIN_HANDLERS[name];
@@ -723,6 +415,12 @@ export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } =
       if (!allowAdmin) {
         return {
           content: [{ type: 'text', text: JSON.stringify(toolErrorEnvelope('Administrative tools are disabled for this transport')) }],
+          isError: true,
+        };
+      }
+      if (!allowGate && CODE_EXECUTING_TOOLS.has(name)) {
+        return {
+          content: [{ type: 'text', text: JSON.stringify(toolErrorEnvelope(`${name} is disabled for this transport; set ORACLE_MCP_GATE_ENABLED=true to allow it`)) }],
           isError: true,
         };
       }
@@ -739,8 +437,7 @@ export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } =
             return allowedRoots.length === 0 || isRootAllowed(root, allowedRoots);
           },
           evict(workspaceId, subprojectId) {
-            const storeKey = `${workspaceId}/${subprojectId}`;
-            openStores.delete(storeKey);
+            openBundles.delete(`${workspaceId}/${subprojectId}`);
           },
         };
         const result = await adminHandler(adminCtx, args || {});
@@ -771,9 +468,10 @@ export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } =
       };
     }
 
+    let ctx;
     try {
       const { workspace_id, subproject_id, ...toolArgs } = args;
-      const ctx = getContext(workspace_id, subproject_id);
+      ctx = getContext(workspace_id, subproject_id, { allowedRoots });
       const raw = await handler(ctx, toolArgs);
 
       if (raw && raw._needs_other_subproject) {
@@ -793,41 +491,15 @@ export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } =
 
       let enriched = enrichEvidence(raw, workspace_id, subproject_id, ctx.subproject);
 
-      // L3 augmentation for open-ended tools — inject L1 context into the model prompt
-      const OPEN_ENDED_TOOLS = new Set([
-        'oracle.context', 'oracle.where_would', 'oracle.conventions_for',
-      ]);
-      if (OPEN_ENDED_TOOLS.has(name) && ctx.l3?.isAvailable()) {
-        try {
-          const verifiedL1Evidence = (enriched.evidence || []).filter(item => ctx.grounding.verifyEvidence(item));
-          if (verifiedL1Evidence.length === 0) throw new Error('No verified L1 evidence available for L3 synthesis');
-          const l1Context = buildL1Context({ ...enriched, evidence: verifiedL1Evidence }, ctx);
-          const l3Result = await ctx.l3.query(JSON.stringify(toolArgs), { maxTokens: 512, l1Context });
-          const synthesisValidation = ctx.weightsPatch.validateSynthesis(
-            l3Result,
-            verifiedL1Evidence,
-            subproject_id,
-          );
-
-          if (synthesisValidation.accepted) {
-            enriched = {
-              ...enriched,
-              answer: enriched.answer,
-              _l3_synthesis: l3Result.text,
-              evidence: verifiedL1Evidence,
-              layer: 'L3',
-            };
-          }
-
-          if (!synthesisValidation.accepted) {
-            ctx.weightsPatch.recordDrift(subproject_id, synthesisValidation.reason);
-            const dir = getSubprojectDir(workspace_id, subproject_id);
-            const driftPath = path.join(dir, 'drift_log.json');
-            try { ctx.weightsPatch.saveDriftLog(driftPath); } catch {}
-          }
-        } catch {
-          // L3 failed — fall back to L1/L2 result silently
-        }
+      // L3 (optional): natural-language synthesis over the verified facts of
+      // open-ended tools, accepted only if it cites nothing outside them.
+      if (ctx.l3) {
+        const { result: synthesized, outcome } = await synthesizeWithL3(ctx, name, toolArgs, enriched, {
+          signal: extra?.signal,
+          driftLogPath: path.join(getSubprojectDir(workspace_id, subproject_id), 'drift_log.json'),
+        });
+        enriched = synthesized;
+        if (outcome.status === 'failed') logThrottled(`[l3] synthesis failed, using L1/L2 result: ${outcome.reason}`);
       }
 
       const result = ctx.grounding.wrap(enriched, name);
@@ -842,18 +514,16 @@ export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } =
 
       const grounded = ctx.grounding.enforceEvidence(result, name);
 
-      if (grounded._error === 'no evidence attached — answer rejected per grounding rules') {
-        const crossCheck = checkCrossSubproject(
-          ctx.workspace, workspace_id, subproject_id, toolArgs, name
-        );
-        if (crossCheck) return crossCheck;
-      }
-
-      const siblingHint = checkCrossSubprojectHint(
-        ctx.workspace, workspace_id, subproject_id, toolArgs, name
-      );
-      if (siblingHint) {
-        grounded._also_in = siblingHint;
+      const siblingIds = findSiblingSubprojects(ctx, workspace_id, subproject_id, toolArgs, name);
+      if (siblingIds.length > 0) {
+        const notHere = grounded.answer?.found === false
+          || grounded._error === 'no evidence attached — answer rejected per grounding rules';
+        if (notHere && CROSS_SUBPROJECT_REROUTE_TOOLS.has(name)) {
+          const searchTerm = toolArgs.symbol || toolArgs.description || toolArgs.target
+            || toolArgs.name || toolArgs.intent || '';
+          return rerouteResponse(siblingIds, searchTerm, subproject_id);
+        }
+        grounded._also_in = siblingIds;
       }
 
       const outputFormat = process.env.ORACLE_OUTPUT_FORMAT || 'toon';
@@ -873,10 +543,23 @@ export async function createMcpServer({ allowAdmin = true, allowedRoots = [] } =
         }],
         isError: true,
       };
+    } finally {
+      ctx?.release();
     }
   });
 
   return server;
+}
+
+// Logs to stderr at most once a minute per distinct message, so a down L3
+// endpoint is visible without flooding the log on every request.
+const lastLogged = new Map();
+function logThrottled(message) {
+  const now = Date.now();
+  if (now - (lastLogged.get(message) || 0) < 60_000) return;
+  lastLogged.set(message, now);
+  if (lastLogged.size > 100) lastLogged.delete(lastLogged.keys().next().value);
+  console.error(message);
 }
 
 function toolErrorEnvelope(message) {
@@ -913,6 +596,7 @@ export async function startMcpServer(opts = {}) {
     }
 
     const allowAdmin = process.env.ORACLE_MCP_ADMIN_ENABLED === 'true';
+    const allowGate = allowAdmin && process.env.ORACLE_MCP_GATE_ENABLED === 'true';
     const allowedRoots = parseAllowedRoots(process.env.ORACLE_ALLOWED_ROOTS || '');
     if (allowAdmin && allowedRoots.length === 0) {
       throw new Error('ORACLE_ALLOWED_ROOTS is required when HTTP administrative tools are enabled');
@@ -984,7 +668,7 @@ export async function startMcpServer(opts = {}) {
                   sessionLastAccess.set(sid, Date.now());
                 },
               });
-              sessionServer = await createMcpServer({ allowAdmin, allowedRoots });
+              sessionServer = await createMcpServer({ allowAdmin, allowGate, allowedRoots });
               createdTransport.onclose = async () => {
                 const sid = createdTransport.sessionId;
                 if (sid) transports.delete(sid);
@@ -1053,7 +737,8 @@ function setupGracefulShutdown({ server, httpServer, transports = new Map(), ses
       activeWatchers.delete(key);
     }
 
-    for (const [key] of [...openStores]) openStores.delete(key);
+    for (const [key] of [...openBundles]) openBundles.delete(key);
+    for (const [key] of [...siblingStores]) siblingStores.delete(key);
 
     for (const transport of transports.values()) {
       try { await transport.close(); } catch {}
@@ -1100,11 +785,6 @@ function isRootAllowed(root, allowedRoots) {
     const relative = path.relative(base, canonical);
     return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
   });
-}
-
-function positiveInt(value, fallback) {
-  const parsed = Number.parseInt(value || '', 10);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function isLoopbackHost(host) {

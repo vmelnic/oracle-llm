@@ -298,7 +298,7 @@ function handleCall(node, scope, ctx) {
   }
 
   // Type reference via type assertion or conversion
-  const typeAssertion = node.text.match(/\.(\([\w\*]+\))\s*$/);
+  const typeAssertion = node.text.match(/\.(\([\w*]+\))\s*$/);
   if (typeAssertion && scope) {
     ctx.edges.push(makeEdge(ctx, {
       source_symbol: scope,

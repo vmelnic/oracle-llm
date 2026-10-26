@@ -257,6 +257,11 @@ function extractClass(node, namespace, filePath, subprojectId, useMap, nodes, ed
   if (isFinal) metadata.final = true;
   if (isAbstract) metadata.abstract = true;
   if (parentClass) metadata.extends = resolvedParent || parentClass;
+  // Calls this class does not define are forwarded elsewhere: a `__call`
+  // method, or an API resource proxying to the model it wraps.
+  const declList0 = node.namedChildren.find(n => n.type === 'declaration_list');
+  const definesMagicCall = !!declList0?.namedChildren.some(m => m.type === 'method_declaration' && m.namedChildren.find(n => n.type === 'name')?.text === '__call');
+  if (definesMagicCall || /(^|\\)(Json)?Resource(Collection)?$/.test(resolvedParent || '')) metadata.forwards_calls = true;
   if (interfaces.length) metadata.implements = interfaces.map(i => resolveType(i, useMap, namespace));
   if (attrs.length) metadata.attributes = attrs.map(a => a.raw);
   if (isEloquentModel) metadata.eloquent = true;
@@ -286,6 +291,20 @@ function extractClass(node, namespace, filePath, subprojectId, useMap, nodes, ed
       target_symbol: resolvedParent,
       target_kind: 'class',
       kind: 'extends',
+      metadata: {},
+    });
+  }
+
+  // `@mixin Foo` (PHPDoc): Foo's methods are callable on this class.
+  for (const mixin of (doc || '').matchAll(/@mixin\s+([\\\w]+)/g)) {
+    edges.push({
+      subproject_id: subprojectId,
+      source_symbol: fqcn,
+      source_kind: 'class',
+      source_path: filePath,
+      target_symbol: resolveType(mixin[1], useMap, namespace),
+      target_kind: 'class',
+      kind: 'mixin',
       metadata: {},
     });
   }
@@ -346,11 +365,12 @@ function extractClass(node, namespace, filePath, subprojectId, useMap, nodes, ed
 
   let eloquentTable = null;
   const eloquentColumns = [];
+  const typeCtx = classTypeContext(declList, fqcn, resolvedParent, useMap, namespace);
 
   for (const member of declList.namedChildren) {
     switch (member.type) {
       case 'method_declaration':
-        extractMethod(member, fqcn, classRoutePath, namespace, filePath, subprojectId, useMap, isMigration, isServiceProvider, isEventSubscriber, nodes, edges);
+        extractMethod(member, fqcn, classRoutePath, namespace, filePath, subprojectId, useMap, isMigration, isServiceProvider, isEventSubscriber, nodes, edges, typeCtx);
         break;
       case 'property_declaration':
         extractProperty(member, fqcn, namespace, filePath, subprojectId, useMap, isEloquentModel, nodes, edges, eloquentColumns, val => { eloquentTable = val; });
@@ -437,9 +457,10 @@ function extractInterface(node, namespace, filePath, subprojectId, useMap, nodes
   const declList = node.namedChildren.find(n => n.type === 'declaration_list');
   if (!declList) return;
 
+  const typeCtx = classTypeContext(declList, fqn, null, useMap, namespace);
   for (const member of declList.namedChildren) {
     if (member.type === 'method_declaration') {
-      extractMethod(member, fqn, '', namespace, filePath, subprojectId, useMap, false, false, false, nodes, edges);
+      extractMethod(member, fqn, '', namespace, filePath, subprojectId, useMap, false, false, false, nodes, edges, typeCtx);
     }
   }
 }
@@ -472,9 +493,10 @@ function extractTrait(node, namespace, filePath, subprojectId, useMap, nodes, ed
   const declList = node.namedChildren.find(n => n.type === 'declaration_list');
   if (!declList) return;
 
+  const typeCtx = classTypeContext(declList, fqn, null, useMap, namespace);
   for (const member of declList.namedChildren) {
     if (member.type === 'method_declaration') {
-      extractMethod(member, fqn, '', namespace, filePath, subprojectId, useMap, false, false, false, nodes, edges);
+      extractMethod(member, fqn, '', namespace, filePath, subprojectId, useMap, false, false, false, nodes, edges, typeCtx);
     } else if (member.type === 'use_declaration') {
       extractTraitUse(member, fqn, filePath, subprojectId, useMap, namespace, edges);
     }
@@ -502,40 +524,41 @@ function extractFunction(node, namespace, filePath, subprojectId, useMap, nodes,
     exported: true,
     signature: `function ${name}(${params.map(p => p.text).join(', ')})${returnType ? `: ${returnType}` : ''}`,
     doc,
-    metadata: {},
+    metadata: classType(returnType, useMap, namespace) ? { return_type: classType(returnType, useMap, namespace) } : {},
   });
 
   for (const p of params) {
-    if (p.type && !isPrimitive(p.type)) {
+    for (const typeTarget of typeTargets(p.type, useMap, namespace)) {
       edges.push({
         subproject_id: subprojectId,
         source_symbol: fqn,
         source_kind: 'function',
         source_path: filePath,
-        target_symbol: resolveType(p.type, useMap, namespace),
+        target_symbol: typeTarget,
         target_kind: 'class',
         kind: 'type_references',
         metadata: { context: 'parameter', name: p.name },
       });
     }
   }
-  if (returnType && !isPrimitive(returnType)) {
+  for (const typeTarget of typeTargets(returnType, useMap, namespace)) {
     edges.push({
       subproject_id: subprojectId,
       source_symbol: fqn,
       source_kind: 'function',
       source_path: filePath,
-      target_symbol: resolveType(returnType, useMap, namespace),
+      target_symbol: typeTarget,
       target_kind: 'class',
       kind: 'type_references',
       metadata: { context: 'return' },
     });
   }
 
-  extractBodyEdges(node, fqn, 'function', filePath, subprojectId, edges, nodes);
+  const typeCtx = { classSymbol: null, parentClass: null, properties: new Map(), useMap, namespace };
+  extractBodyEdges(node, fqn, 'function', filePath, subprojectId, edges, nodes, { ...typeCtx, locals: localTypes(node, params, typeCtx) });
 }
 
-function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, subprojectId, useMap, isMigration, isServiceProvider, isEventSubscriber, nodes, edges) {
+function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, subprojectId, useMap, isMigration, isServiceProvider, isEventSubscriber, nodes, edges, typeCtx) {
   const nameNode = node.namedChildren.find(n => n.type === 'name');
   if (!nameNode) return;
   const name = nameNode.text;
@@ -554,6 +577,9 @@ function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, 
   if (isStatic) metadata.static = true;
   if (isAbstract) metadata.abstract = true;
   if (attrs.length) metadata.attributes = attrs.map(a => a.raw);
+  // Class the method returns, resolved, for calls chained on its result.
+  const returnClass = /^\??(static|self|\$this)$/.test(returnType || '') ? parentSymbol : classType(returnType, useMap, namespace);
+  if (returnClass) metadata.return_type = returnClass;
 
   const paramTexts = params.map(p => p.text);
 
@@ -578,26 +604,26 @@ function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, 
   }
 
   for (const p of params) {
-    if (p.type && !isPrimitive(p.type)) {
+    for (const typeTarget of typeTargets(p.type, useMap, namespace)) {
       edges.push({
         subproject_id: subprojectId,
         source_symbol: symbol,
         source_kind: 'method',
         source_path: filePath,
-        target_symbol: resolveType(p.type, useMap, namespace),
+        target_symbol: typeTarget,
         target_kind: 'class',
         kind: 'type_references',
         metadata: { context: 'parameter', name: p.name },
       });
     }
   }
-  if (returnType && !isPrimitive(returnType)) {
+  for (const typeTarget of typeTargets(returnType, useMap, namespace)) {
     edges.push({
       subproject_id: subprojectId,
       source_symbol: symbol,
       source_kind: 'method',
       source_path: filePath,
-      target_symbol: resolveType(returnType, useMap, namespace),
+      target_symbol: typeTarget,
       target_kind: 'class',
       kind: 'type_references',
       metadata: { context: 'return' },
@@ -634,26 +660,28 @@ function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, 
     }
   }
 
-  if (name.startsWith('provide') && returnType && !isPrimitive(returnType)) {
+  const providedType = name.startsWith('provide') ? classType(returnType, useMap, namespace) : null;
+  if (providedType) {
     edges.push({
       subproject_id: subprojectId,
       source_symbol: parentSymbol,
       source_kind: 'class',
       source_path: filePath,
-      target_symbol: resolveType(returnType, useMap, namespace),
+      target_symbol: providedType,
       target_kind: 'class',
       kind: 'provides',
       metadata: { method: name },
     });
   }
 
-  if (isEventSubscriber && name === 'handle' && params.length > 0 && params[0].type && !isPrimitive(params[0].type)) {
+  const handledEvent = isEventSubscriber && name === 'handle' ? classType(params[0]?.type, useMap, namespace) : null;
+  if (handledEvent) {
     edges.push({
       subproject_id: subprojectId,
       source_symbol: symbol,
       source_kind: 'method',
       source_path: filePath,
-      target_symbol: resolveType(params[0].type, useMap, namespace),
+      target_symbol: handledEvent,
       target_kind: 'event',
       kind: 'consumes_event',
       metadata: {},
@@ -661,14 +689,14 @@ function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, 
   }
 
   if (name.startsWith('onKernel') || name.startsWith('onSecurity') || name.startsWith('onForm')) {
-    const eventParam = params.find(p => p.type && !isPrimitive(p.type));
+    const eventParam = params.find(p => classType(p.type, useMap, namespace));
     if (eventParam) {
       edges.push({
         subproject_id: subprojectId,
         source_symbol: symbol,
         source_kind: 'method',
         source_path: filePath,
-        target_symbol: resolveType(eventParam.type, useMap, namespace),
+        target_symbol: classType(eventParam.type, useMap, namespace),
         target_kind: 'event',
         kind: 'consumes_event',
         metadata: {},
@@ -688,7 +716,7 @@ function extractMethod(node, parentSymbol, classRoutePath, namespace, filePath, 
   }
 
   extractConstructorInjections(name, params, parentSymbol, filePath, subprojectId, useMap, namespace, edges);
-  extractBodyEdges(node, symbol, 'method', filePath, subprojectId, edges, nodes);
+  extractBodyEdges(node, symbol, 'method', filePath, subprojectId, edges, nodes, { ...typeCtx, locals: localTypes(node, params, typeCtx) });
 }
 
 function extractProperty(node, parentSymbol, namespace, filePath, subprojectId, useMap, isEloquentModel, nodes, edges, eloquentColumns, setTable) {
@@ -748,13 +776,13 @@ function extractProperty(node, parentSymbol, namespace, filePath, subprojectId, 
     const isDoctrineColumn = attrs.some(a => attrNameMatches(a.name, 'Column', 'ORM'));
     if (isDoctrineColumn) metadata.doctrine_column = true;
 
-    if (typeStr && !isPrimitive(typeStr)) {
+    for (const typeTarget of typeTargets(typeStr, useMap, namespace)) {
       edges.push({
         subproject_id: subprojectId,
         source_symbol: symbol,
         source_kind: 'property',
         source_path: filePath,
-        target_symbol: resolveType(typeStr, useMap, namespace),
+        target_symbol: typeTarget,
         target_kind: 'class',
         kind: 'type_references',
         metadata: {},
@@ -833,7 +861,7 @@ function extractTraitUse(node, parentSymbol, filePath, subprojectId, useMap, nam
   }
 }
 
-function extractRouteFromAttribute(routeAttr, classRoutePath, methodSymbol, classSymbol, methodName, filePath, subprojectId, node, nodes, edges) {
+function extractRouteFromAttribute(routeAttr, classRoutePath, methodSymbol, classSymbol, methodName, filePath, subprojectId, node, nodes, _edges) {
   const pathArg = routeAttr.args.find(a => a.key === null || a.key === 'path');
   const methodsArg = routeAttr.args.find(a => a.key === 'methods');
   const nameArg = routeAttr.args.find(a => a.key === 'name');
@@ -894,8 +922,7 @@ function extractConstructorInjections(methodName, params, parentSymbol, filePath
   if (methodName !== '__construct') return;
 
   for (const p of params) {
-    if (p.type && !isPrimitive(p.type)) {
-      const resolved = resolveType(p.type, useMap, namespace);
+    for (const resolved of typeTargets(p.type, useMap, namespace)) {
       edges.push({
         subproject_id: subprojectId,
         source_symbol: parentSymbol,
@@ -910,7 +937,7 @@ function extractConstructorInjections(methodName, params, parentSymbol, filePath
   }
 }
 
-function extractBodyEdges(node, sourceSymbol, sourceKind, filePath, subprojectId, edges, nodes) {
+function extractBodyEdges(node, sourceSymbol, sourceKind, filePath, subprojectId, edges, nodes, typeCtx) {
   const body = node.namedChildren.find(n => n.type === 'compound_statement');
   if (!body) return;
 
@@ -923,30 +950,26 @@ function extractBodyEdges(node, sourceSymbol, sourceKind, filePath, subprojectId
           source_symbol: sourceSymbol,
           source_kind: sourceKind,
           source_path: filePath,
-          target_symbol: nameNode.text,
+          target_symbol: typeCtx ? resolveType(nameNode.text, typeCtx.useMap, typeCtx.namespace) : nameNode.text,
           target_kind: 'class',
           kind: 'calls',
-          metadata: { type: 'instantiation' },
+          metadata: { type: 'instantiation', line: child.startPosition.row + 1 },
         });
       }
     }
 
-    if (child.type === 'member_call_expression') {
-      const obj = child.namedChildren[0];
-      const methodNode = child.namedChildren.find(n => n.type === 'name' && n !== obj);
-      if (methodNode) {
-        const objText = obj?.text ?? '';
+    if (child.type === 'member_call_expression' || child.type === 'nullsafe_member_call_expression') {
+      const obj = child.childForFieldName('object');
+      const methodNode = child.childForFieldName('name');
+      if (obj && methodNode?.type === 'name') {
+        const objText = obj.text;
         const isThis = objText === '$this';
-        edges.push({
-          subproject_id: subprojectId,
-          source_symbol: sourceSymbol,
-          source_kind: sourceKind,
-          source_path: filePath,
-          target_symbol: isThis ? `${sourceSymbol.split('::')[0]}::${methodNode.text}` : methodNode.text,
-          target_kind: 'method',
-          kind: 'calls',
-          metadata: isThis ? { self_call: true } : { receiver: objText },
-        });
+        const receiverType = expressionType(obj, typeCtx);
+        edges.push(callEdge(subprojectId, sourceSymbol, sourceKind, filePath, methodNode, {
+          receiver: objText,
+          receiverType,
+          self: isThis,
+        }));
 
         const methodName = methodNode.text;
         if (methodName === 'render' && (isThis || objText.endsWith('twig'))) {
@@ -1013,21 +1036,23 @@ function extractBodyEdges(node, sourceSymbol, sourceKind, filePath, subprojectId
     }
 
     if (child.type === 'scoped_call_expression') {
-      const scopeNode = child.namedChildren.find(n => n.type === 'name' || n.type === 'qualified_name');
-      const allNames = child.namedChildren.filter(n => n.type === 'name');
-      const methodNode = allNames.length >= 2 ? allNames[1] : null;
-      if (scopeNode && methodNode) {
-        edges.push({
-          subproject_id: subprojectId,
-          source_symbol: sourceSymbol,
-          source_kind: sourceKind,
-          source_path: filePath,
-          target_symbol: `${scopeNode.text}::${methodNode.text}`,
-          target_kind: 'method',
-          kind: 'calls',
-          metadata: { static_call: true },
-        });
-
+      const scopeNode = child.childForFieldName('scope');
+      const methodNode = child.childForFieldName('name');
+      if (scopeNode && methodNode?.type === 'name') {
+        const scopeText = scopeNode.text;
+        const relative = scopeNode.type === 'relative_scope';
+        const named = scopeNode.type === 'name' || scopeNode.type === 'qualified_name';
+        let receiverType;
+        if (relative) receiverType = scopeText === 'parent' ? typeCtx?.parentClass : typeCtx?.classSymbol;
+        else if (named) receiverType = resolveType(scopeText, typeCtx?.useMap ?? new Map(), typeCtx?.namespace);
+        else receiverType = expressionType(scopeNode, typeCtx);
+        edges.push(callEdge(subprojectId, sourceSymbol, sourceKind, filePath, methodNode, {
+          receiver: scopeText,
+          receiverType,
+          self: relative && scopeText !== 'parent',
+        }));
+      }
+      if ((scopeNode?.type === 'name' || scopeNode?.type === 'qualified_name') && methodNode) {
         const cls = scopeNode.text;
         const methodName = methodNode.text;
         if (cls === 'Event' && methodName === 'listen') {
@@ -1392,7 +1417,7 @@ function extractTopLevelExpressions(node, namespace, filePath, subprojectId, use
   });
 }
 
-function extractLaravelRoute(node, method, filePath, subprojectId, useMap, namespace, nodes, edges) {
+function extractLaravelRoute(node, method, filePath, subprojectId, useMap, namespace, nodes, _edges) {
   const argsNode = node.namedChildren.find(n => n.type === 'arguments');
   if (!argsNode) return;
 
@@ -1619,6 +1644,220 @@ function extractFirstStringArg(node) {
   const strNode = firstArg?.namedChildren?.find(n => n.type === 'string');
   const content = strNode?.namedChildren?.find(n => n.type === 'string_content');
   return content?.text ?? null;
+}
+
+// ── Receiver types for method calls (see src/graph/calls.js) ──
+
+// Static methods that return an instance of their class.
+const FACTORY_METHODS = new Set([
+  'make', 'create', 'new', 'from', 'fromArray', 'getInstance', 'instance',
+  'find', 'findOrFail', 'first', 'firstOrFail', 'firstOrCreate', 'firstOrNew', 'updateOrCreate',
+]);
+// Container lookups: app(Foo::class), resolve(Foo::class), $this->app->make(Foo::class).
+const CONTAINER_FUNCTIONS = new Set(['app', 'resolve']);
+const CONTAINER_METHODS = new Set(['make', 'get', 'makeWith']);
+
+function callEdge(subprojectId, sourceSymbol, sourceKind, filePath, methodNode, { receiver, receiverType, self }) {
+  const method = methodNode.text;
+  const typeName = typeof receiverType === 'string' ? receiverType : null;
+  return {
+    subproject_id: subprojectId,
+    source_symbol: sourceSymbol,
+    source_kind: sourceKind,
+    source_path: filePath,
+    target_symbol: typeName ? `${typeName}::${method}` : method,
+    target_kind: 'method',
+    kind: 'calls',
+    metadata: {
+      call: {
+        ...describeCall(method, receiver, receiverType, self),
+        line: methodNode.startPosition.row + 1,
+      },
+    },
+  };
+}
+
+// `receiverType` is a class name, `{ call }` (the receiver is what another
+// call returns, resolved by the builder from that method's return type) or null.
+function describeCall(method, receiver, receiverType, self) {
+  const typeName = typeof receiverType === 'string' ? receiverType : null;
+  return {
+    method,
+    receiver: receiver.length > 120 ? `${receiver.slice(0, 117)}...` : receiver,
+    ...(typeName ? { receiver_type: typeName } : {}),
+    ...(receiverType?.call ? { receiver_call: receiverType.call } : {}),
+    ...(self && typeName ? { self: true } : {}),
+  };
+}
+
+// The call an expression is, as a nested call description (no line).
+function callDescription(expr, typeCtx, depth = 0) {
+  if (depth > 3) return null;
+  if (expr.type === 'member_call_expression' || expr.type === 'nullsafe_member_call_expression') {
+    const obj = expr.childForFieldName('object');
+    const name = expr.childForFieldName('name');
+    if (!obj || name?.type !== 'name') return null;
+    return describeCall(name.text, obj.text, expressionType(obj, typeCtx, depth + 1), obj.text === '$this');
+  }
+  if (expr.type === 'scoped_call_expression') {
+    const scope = expr.childForFieldName('scope');
+    const name = expr.childForFieldName('name');
+    if (!scope || name?.type !== 'name') return null;
+    const relative = scope.type === 'relative_scope';
+    let type;
+    if (relative) type = scope.text === 'parent' ? typeCtx.parentClass : typeCtx.classSymbol;
+    else type = classType(scope.text, typeCtx.useMap, typeCtx.namespace);
+    return describeCall(name.text, scope.text, type, relative && scope.text !== 'parent');
+  }
+  return null;
+}
+
+// `?Foo`, `Foo|null` -> `Foo`; null for scalars and unions of classes.
+function classType(typeText, useMap, namespace) {
+  if (!typeText) return null;
+  const members = typeText.replace(/^\?/, '').split('|').map(t => t.trim()).filter(t => t && t.toLowerCase() !== 'null');
+  if (members.length !== 1 || members[0].includes('&') || isPrimitive(members[0])) return null;
+  return resolveType(members[0], useMap, namespace);
+}
+
+// Every class in a type (`?Foo`, `Foo|Bar|null`, `Foo&Bar`), resolved; scalars dropped.
+function typeTargets(typeText, useMap, namespace) {
+  if (!typeText) return [];
+  return [...new Set(typeText.replace(/^\?/, '').split(/[|&]/)
+    .map(t => t.trim().replace(/^\(|\)$/g, ''))
+    .filter(t => t && t.toLowerCase() !== 'null' && !isPrimitive(t))
+    .map(t => resolveType(t, useMap, namespace)))];
+}
+
+function docVarType(comment, varName) {
+  const match = comment.match(/@var\s+([\\\w|?]+)(?:\s+\$(\w+))?/);
+  if (!match || (varName && match[2] && match[2] !== varName)) return null;
+  return { type: match[1], name: match[2] || null };
+}
+
+/**
+ * Types of a class's properties: typed and promoted properties, `@var`
+ * docblocks, and `$this->x = $typedParam` / `$this->x = new Foo()`.
+ */
+function classTypeContext(declList, classSymbol, parentClass, useMap, namespace) {
+  const properties = new Map();
+  const set = (name, typeText) => {
+    const type = classType(typeText, useMap, namespace);
+    if (type && !properties.has(name)) properties.set(name, type);
+  };
+  for (const member of declList.namedChildren) {
+    if (member.type === 'property_declaration') {
+      const typeNode = member.namedChildren.find(n => ['named_type', 'optional_type', 'union_type'].includes(n.type));
+      const doc = getDocComment(member);
+      for (const el of member.namedChildren.filter(n => n.type === 'property_element')) {
+        const name = el.namedChildren.find(n => n.type === 'variable_name')?.text.replace(/^\$/, '');
+        if (!name) continue;
+        if (typeNode) set(name, typeNode.text);
+        else if (doc) set(name, docVarType(doc, name)?.type);
+      }
+    } else if (member.type === 'method_declaration') {
+      const params = extractParams(member);
+      const paramTypes = new Map(params.filter(p => p.type).map(p => [p.name, p.type]));
+      for (const p of params) if (p.promoted && p.type) set(p.name, p.type);
+      walkNode(member, (n) => {
+        if (n.type !== 'assignment_expression') return;
+        const left = n.childForFieldName('left');
+        const right = n.childForFieldName('right');
+        if (left?.type !== 'member_access_expression' || left.childForFieldName('object')?.text !== '$this') return;
+        const name = left.childForFieldName('name')?.text;
+        if (!name || !right) return;
+        if (right.type === 'variable_name' && paramTypes.has(right.text.slice(1))) set(name, paramTypes.get(right.text.slice(1)));
+        else if (right.type === 'object_creation_expression') set(name, creationClass(right));
+      });
+    }
+  }
+  return { classSymbol, parentClass, properties, useMap, namespace };
+}
+
+/** Types of a function's variables: typed parameters, assignments, `@var`. */
+function localTypes(fnNode, params, typeCtx) {
+  const locals = new Map();
+  const ctx = { ...typeCtx, locals };
+  const set = (name, type) => { if (name && type && !locals.has(name)) locals.set(name, type); };
+  for (const p of params) set(p.name, classType(p.type, typeCtx.useMap, typeCtx.namespace));
+  const body = fnNode.namedChildren.find(n => n.type === 'compound_statement');
+  if (!body) return locals;
+  walkNode(body, (n) => {
+    if (n.type === 'assignment_expression') {
+      const left = n.childForFieldName('left');
+      const right = n.childForFieldName('right');
+      if (left?.type === 'variable_name' && right) set(left.text.slice(1), expressionType(right, ctx));
+    } else if (n.type === 'simple_parameter') {
+      const typeNode = n.namedChildren.find(c => ['named_type', 'optional_type', 'union_type'].includes(c.type));
+      const name = n.namedChildren.find(c => c.type === 'variable_name')?.text.slice(1);
+      set(name, classType(typeNode?.text, typeCtx.useMap, typeCtx.namespace));
+    } else if (n.type === 'comment' && n.text.startsWith('/**')) {
+      const doc = docVarType(n.text);
+      if (doc?.name) set(doc.name, classType(doc.type, typeCtx.useMap, typeCtx.namespace));
+    }
+  });
+  return locals;
+}
+
+function creationClass(node) {
+  return node.namedChildren.find(n => n.type === 'name' || n.type === 'qualified_name')?.text ?? null;
+}
+
+// The class an expression evaluates to: a class name when it can be told
+// syntactically, `{ call }` when it is the result of a method call, or null.
+function expressionType(expr, typeCtx, depth = 0) {
+  if (!expr || !typeCtx || depth > 3) return null;
+  const resolve = (name) => {
+    if (!name) return null;
+    if (name === 'self' || name === 'static') return typeCtx.classSymbol;
+    if (name === 'parent') return typeCtx.parentClass;
+    return classType(name, typeCtx.useMap, typeCtx.namespace);
+  };
+  switch (expr.type) {
+    case 'parenthesized_expression':
+      return expressionType(expr.namedChildren[0], typeCtx, depth + 1);
+    case 'object_creation_expression': {
+      const name = creationClass(expr);
+      if (name) return resolve(name);
+      return expr.text.match(/^new\s+(self|static)\b/) ? typeCtx.classSymbol : null;
+    }
+    case 'variable_name':
+      return expr.text === '$this' ? typeCtx.classSymbol : (typeCtx.locals?.get(expr.text.slice(1)) ?? null);
+    case 'member_access_expression':
+    case 'nullsafe_member_access_expression':
+      return expr.childForFieldName('object')?.text === '$this'
+        ? (typeCtx.properties.get(expr.childForFieldName('name')?.text) ?? null)
+        : null;
+    case 'scoped_call_expression': {
+      const scope = expr.childForFieldName('scope');
+      if (FACTORY_METHODS.has(expr.childForFieldName('name')?.text) && scope) return resolve(scope.text);
+      const call = callDescription(expr, typeCtx, depth);
+      return call ? { call } : null;
+    }
+    case 'function_call_expression': {
+      const fn = expr.childForFieldName('function')?.text;
+      return CONTAINER_FUNCTIONS.has(fn) ? resolve(classConstantArg(expr)) : null;
+    }
+    case 'member_call_expression':
+    case 'nullsafe_member_call_expression': {
+      if (CONTAINER_METHODS.has(expr.childForFieldName('name')?.text) && /->app$/.test(expr.childForFieldName('object')?.text || '')) {
+        return resolve(classConstantArg(expr));
+      }
+      const call = callDescription(expr, typeCtx, depth);
+      return call ? { call } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+// `Foo::class` as the first argument -> `Foo`.
+function classConstantArg(callNode) {
+  const args = callNode.childForFieldName('arguments');
+  const first = args?.namedChildren.find(n => n.type === 'argument')?.namedChildren[0];
+  if (first?.type !== 'class_constant_access_expression') return null;
+  const [cls, constant] = first.namedChildren;
+  return constant?.text === 'class' ? cls?.text ?? null : null;
 }
 
 function walkNode(node, visitor) {

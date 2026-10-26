@@ -1,7 +1,6 @@
 import fs from 'fs';
 import { atomicWriteFileSync } from '../utils/atomic-write.js';
 import path from 'path';
-import crypto from 'crypto';
 
 export class PatternCatalogue {
   constructor(store) {
@@ -24,7 +23,8 @@ export class PatternCatalogue {
         name: shape,
         kind: members[0].kind,
         frequency: { count: members.length, total },
-        template: buildTemplate(canonical),
+        // The canonical symbol lets tools cite verifiable evidence for the pattern.
+        template: { symbol: canonical.symbol, ...buildTemplate(canonical) },
         canonical: { path: canonical.path, line: canonical.start_line },
         variants,
         members: members.map(m => ({
@@ -112,7 +112,10 @@ function computeShape(node) {
     const paramCount = countParams(node.signature);
     const hasReturn = meta.return_type && meta.return_type !== 'void';
     const hasDoc = !!node.doc;
-    return `fn:async=${!!isAsync}:params=${paramCount}:returns=${!!hasReturn}:doc=${hasDoc}`;
+    // Kind is part of the shape: functions and methods are separate patterns,
+    // so a pattern's count never exceeds the total for its kind.
+    const prefix = kind === 'method' ? 'method' : 'fn';
+    return `${prefix}:async=${!!isAsync}:params=${paramCount}:returns=${!!hasReturn}:doc=${hasDoc}`;
   }
 
   if (kind === 'class') {
@@ -143,29 +146,11 @@ function computeShape(node) {
   return `${kind}:generic`;
 }
 
-function normalizePath(routePath) {
-  if (!routePath) return 'unknown';
-  return routePath
-    .replace(/\/\{[^}]+\}/g, '/:param')
-    .replace(/\/:[^/]+/g, '/:param')
-    .replace(/\/\d+/g, '/:id')
-    .split('/')
-    .slice(0, 3)
-    .join('/');
-}
-
 function countParams(signature) {
   if (!signature) return 0;
   const match = signature.match(/\(([^)]*)\)/);
   if (!match || !match[1].trim()) return 0;
   return match[1].split(',').length;
-}
-
-function bucket(n) {
-  if (n === 0) return '0';
-  if (n <= 3) return '1-3';
-  if (n <= 7) return '4-7';
-  return '8+';
 }
 
 function countTotalOfKind(nodes, kind) {

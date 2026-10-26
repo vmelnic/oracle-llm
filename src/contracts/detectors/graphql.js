@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class GraphQLDetector {
   async detect(subproject) {
     const surfaces = [];
-    const gqlFiles = await fg(
+    const gqlFiles = await globFiles(
       ['**/*.graphql', '**/*.gql', '**/schema.graphqls'],
-      { cwd: subproject.root, absolute: true, ignore: ['node_modules/**'] }
+      { cwd: subproject.root, absolute: true }
     );
 
     for (const f of gqlFiles) {

@@ -1,22 +1,7 @@
 import Database from 'better-sqlite3';
-import { chmodSync, readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
-
-const NODE_KINDS = new Set([
-  'function', 'class', 'method', 'route', 'component', 'store', 'migration',
-  'db_table', 'api_endpoint', 'event', 'config_key', 'env_var', 'interface',
-  'type_alias', 'trait', 'mixin', 'property', 'decorator', 'hook', 'provider',
-  'directive', 'pipe', 'module', 'enum', 'doc_section',
-]);
-
-const EDGE_KINDS = new Set([
-  'calls', 'imports', 'reexports', 'queries', 'renders', 'depends_on', 'fires_event',
-  'consumes_event', 'migrates_table', 'serves_route', 'implements', 'extends',
-  'uses_trait', 'provides', 'injects', 'type_references', 'reads_config',
-]);
+import { chmodSync } from 'node:fs';
+import { applyMigrations, memberName, shortSymbol } from './migrations.js';
+import { positiveInt } from '../utils/env.js';
 
 export class GraphStore {
   constructor(dbPath) {
@@ -27,24 +12,18 @@ export class GraphStore {
     this.db.pragma('busy_timeout = 5000');
     this.db.pragma('synchronous = NORMAL');
     this.db.pragma('wal_autocheckpoint = 1000');
-    this._createSchema();
+    try {
+      applyMigrations(this.db);
+    } catch (err) {
+      this.db.close();
+      throw err;
+    }
     const integrity = this.db.pragma('quick_check', { simple: true });
     if (integrity !== 'ok') {
       this.db.close();
       throw new Error(`SQLite integrity check failed: ${integrity}`);
     }
-    const schemaVersion = this.db.prepare('SELECT MAX(version) AS version FROM schema_version').get()?.version || 0;
-    if (schemaVersion > 2) {
-      this.db.close();
-      throw new Error(`Database schema v${schemaVersion} is newer than supported v2`);
-    }
     this._prepareStatements();
-  }
-
-  _createSchema() {
-    const schemaPath = join(__dirname, 'schema.sql');
-    const sql = readFileSync(schemaPath, 'utf-8');
-    this.db.exec(sql);
   }
 
   async withTransaction(operation) {
@@ -62,11 +41,16 @@ export class GraphStore {
     }
   }
 
+  /** Runs a synchronous function atomically; nests inside an outer transaction. */
+  runInTransaction(operation) {
+    return this.db.transaction(operation)();
+  }
+
   _prepareStatements() {
     this._stmts = {
       upsertNode: this.db.prepare(`
-        INSERT INTO nodes (subproject_id, path, lang, symbol, kind, parent_id, start_line, end_line, exported, signature, doc, commit_sha, file_blob_hash, metadata)
-        VALUES (@subprojectId, @path, @lang, @symbol, @kind, @parentId, @startLine, @endLine, @exported, @signature, @doc, @commitSha, @fileBlobHash, @metadata)
+        INSERT INTO nodes (subproject_id, path, lang, symbol, kind, parent_id, start_line, end_line, exported, signature, doc, commit_sha, file_blob_hash, metadata, short_symbol, member_name)
+        VALUES (@subprojectId, @path, @lang, @symbol, @kind, @parentId, @startLine, @endLine, @exported, @signature, @doc, @commitSha, @fileBlobHash, @metadata, @shortSymbol, @memberName)
         ON CONFLICT(subproject_id, path, symbol, kind, start_line)
         DO UPDATE SET
           lang = excluded.lang,
@@ -92,6 +76,7 @@ export class GraphStore {
       `),
 
       deleteNodeById: this.db.prepare(`DELETE FROM nodes WHERE id = ?`),
+      parkNode: this.db.prepare(`UPDATE nodes SET start_line = -id WHERE id = ?`),
 
       updateNodeById: this.db.prepare(`
         UPDATE nodes SET
@@ -99,7 +84,7 @@ export class GraphStore {
           kind = @kind, parent_id = @parentId, start_line = @startLine,
           end_line = @endLine, exported = @exported, signature = @signature,
           doc = @doc, commit_sha = @commitSha, file_blob_hash = @fileBlobHash,
-          metadata = @metadata
+          metadata = @metadata, short_symbol = @shortSymbol, member_name = @memberName
         WHERE id = @id
       `),
 
@@ -142,6 +127,48 @@ export class GraphStore {
       `),
 
       getIndexedFiles: this.db.prepare(`SELECT path FROM file_hashes WHERE subproject_id = ?`),
+      getDependentPathsOfFile: this.db.prepare(`
+        SELECT DISTINCT s.path FROM nodes t
+        JOIN edges e ON e.target_id = t.id
+        JOIN nodes s ON s.id = e.source_id
+        WHERE t.subproject_id = ? AND t.path = ? AND s.path != t.path
+      `),
+      getDependentPathsOfNode: this.db.prepare(`
+        SELECT DISTINCT s.path FROM edges e
+        JOIN nodes s ON s.id = e.source_id
+        WHERE e.target_id = ?
+      `),
+      deleteUnresolvedRefs: this.db.prepare(`DELETE FROM unresolved_refs WHERE subproject_id = ? AND source_path = ?`),
+      insertUnresolvedRef: this.db.prepare(`
+        INSERT OR IGNORE INTO unresolved_refs (subproject_id, source_path, target_key, ref_kind) VALUES (?, ?, ?, ?)
+      `),
+      findPathsByRefKind: this.db.prepare(`
+        SELECT DISTINCT source_path FROM unresolved_refs WHERE subproject_id = ? AND target_key = ? AND ref_kind = ?
+        ORDER BY source_path
+      `),
+      getMeta: this.db.prepare(`SELECT value FROM graph_meta WHERE key = ?`),
+      setMeta: this.db.prepare(`
+        INSERT INTO graph_meta (key, value) VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+      `),
+      findMembersByName: this.db.prepare(`
+        SELECT * FROM nodes WHERE subproject_id = ? AND member_name = ? AND kind = ?
+        ORDER BY path, start_line
+      `),
+      findInheritanceParents: this.db.prepare(`
+        SELECT n.* FROM edges e JOIN nodes n ON n.id = e.target_id
+        WHERE e.source_id = ? AND e.kind IN ('extends', 'implements', 'uses_trait', 'mixin')
+        ORDER BY CASE e.kind WHEN 'extends' THEN 0 WHEN 'uses_trait' THEN 1 WHEN 'mixin' THEN 2 ELSE 3 END, n.path, n.start_line
+      `),
+      findInheritanceChildren: this.db.prepare(`
+        SELECT n.* FROM edges e JOIN nodes n ON n.id = e.source_id
+        WHERE e.target_id = ? AND e.kind IN ('extends', 'implements', 'uses_trait', 'mixin')
+        ORDER BY n.path, n.start_line
+      `),
+      findPathsByUnresolvedKey: this.db.prepare(`
+        SELECT DISTINCT source_path FROM unresolved_refs WHERE subproject_id = ? AND target_key = ?
+      `),
+      clearSubprojectUnresolvedRefs: this.db.prepare(`DELETE FROM unresolved_refs WHERE subproject_id = ?`),
       deleteFileHash: this.db.prepare(`DELETE FROM file_hashes WHERE subproject_id = ? AND path = ?`),
 
       getSymbolsInRange: this.db.prepare(`
@@ -168,7 +195,7 @@ export class GraphStore {
         ) AS ref_count
         FROM nodes n
         WHERE n.subproject_id = ? AND n.symbol = ?
-        ORDER BY ref_count DESC
+        ORDER BY ref_count DESC, n.path, n.start_line
       `),
       locateBySymbolAndKind: this.db.prepare(`
         SELECT n.*, (
@@ -176,15 +203,15 @@ export class GraphStore {
         ) AS ref_count
         FROM nodes n
         WHERE n.subproject_id = ? AND n.symbol = ? AND n.kind = ?
-        ORDER BY ref_count DESC
+        ORDER BY ref_count DESC, n.path, n.start_line
       `),
       locateBySuffix: this.db.prepare(`
         SELECT n.*, (
           SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id
         ) AS ref_count
         FROM nodes n
-        WHERE n.subproject_id = ? AND n.symbol LIKE ?
-        ORDER BY ref_count DESC
+        WHERE n.subproject_id = ? AND n.short_symbol = ? AND substr(n.symbol, -length(?)) = ?
+        ORDER BY ref_count DESC, n.path, n.start_line
         LIMIT 10
       `),
       locateBySuffixAndKind: this.db.prepare(`
@@ -192,8 +219,8 @@ export class GraphStore {
           SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id
         ) AS ref_count
         FROM nodes n
-        WHERE n.subproject_id = ? AND n.symbol LIKE ? AND n.kind = ?
-        ORDER BY ref_count DESC
+        WHERE n.subproject_id = ? AND n.short_symbol = ? AND substr(n.symbol, -length(?)) = ? AND n.kind = ?
+        ORDER BY ref_count DESC, n.path, n.start_line
         LIMIT 10
       `),
 
@@ -201,10 +228,11 @@ export class GraphStore {
         SELECT DISTINCT n.id, n.subproject_id, n.path, n.lang, n.symbol, n.kind,
                n.parent_id, n.start_line, n.end_line, n.exported, n.signature, n.doc,
                n.commit_sha, n.file_blob_hash, n.metadata,
-               e.kind AS edge_kind
+               e.kind AS edge_kind, e.metadata AS edge_metadata
         FROM edges e
         JOIN nodes n ON e.source_id = n.id
         WHERE e.target_id = ?
+        ORDER BY CASE e.kind WHEN 'calls' THEN 0 ELSE 1 END, n.path, n.start_line
       `),
 
       impactOneHop: this.db.prepare(`
@@ -263,14 +291,32 @@ export class GraphStore {
         if (!used.has(row.id)) this._stmts.deleteNodeById.run(row.id);
       }
 
+      // Kept rows may trade places (two same-named nodes moving past each
+      // other): park them on unique temporary lines first, so no update hits
+      // the (path, symbol, kind, start_line) key of a row not yet moved.
+      for (const { match } of matches) {
+        if (match) this._stmts.parkNode.run(match.id);
+      }
+
       const ids = [];
+      const byKey = new Map();
       for (const { normalized, match } of matches) {
+        // Identical nodes (same key) share one row.
+        const key = `${normalized.symbol}\x00${normalized.kind}\x00${normalized.startLine}`;
+        if (byKey.has(key)) {
+          if (match) this._stmts.deleteNodeById.run(match.id);
+          ids.push(byKey.get(key));
+          continue;
+        }
+        let id;
         if (match) {
           this._stmts.updateNodeById.run({ ...normalized, id: match.id });
-          ids.push(match.id);
+          id = match.id;
         } else {
-          ids.push(this._stmts.upsertNode.get(normalized).id);
+          id = this._stmts.upsertNode.get(normalized).id;
         }
+        byKey.set(key, id);
+        ids.push(id);
       }
       return ids;
     });
@@ -394,8 +440,78 @@ export class GraphStore {
       this._stmts.deleteEdgesByFile.run(subprojectId, filePath);
       this._stmts.deleteNodesByFile.run(subprojectId, filePath);
       this._stmts.deleteFileHash.run(subprojectId, filePath);
+      this._stmts.deleteUnresolvedRefs.run(subprojectId, filePath);
     });
     remove();
+  }
+
+  /** Paths of other files with edges into any node of `filePath`. */
+  getDependentPathsOfFile(subprojectId, filePath) {
+    return this._stmts.getDependentPathsOfFile.all(subprojectId, filePath).map(row => row.path);
+  }
+
+  /** Paths of files with edges into any of the given nodes. */
+  getDependentPathsOfNodes(nodeIds) {
+    const paths = new Set();
+    for (const id of nodeIds) {
+      for (const row of this._stmts.getDependentPathsOfNode.all(id)) paths.add(row.path);
+    }
+    return [...paths];
+  }
+
+  /**
+   * Replaces the name-based references of a file. `refs` holds plain keys
+   * (kind 'symbol') or `{ key, kind }` with kind 'symbol' | 'call' | 'soft'.
+   */
+  setUnresolvedRefs(subprojectId, filePath, refs) {
+    const replace = this.db.transaction(() => {
+      this._stmts.deleteUnresolvedRefs.run(subprojectId, filePath);
+      for (const ref of refs) {
+        const { key, kind } = typeof ref === 'string' ? { key: ref, kind: 'symbol' } : ref;
+        this._stmts.insertUnresolvedRef.run(subprojectId, filePath, key, kind);
+      }
+    });
+    replace();
+  }
+
+  /** Files with method calls named `name` whose receiver type is unknown. */
+  findPossibleCallSites(subprojectId, name) {
+    return this._stmts.findPathsByRefKind.all(subprojectId, String(name).toLowerCase(), 'call').map(r => r.source_path);
+  }
+
+  getMeta(key) {
+    return this._stmts.getMeta.get(key)?.value ?? null;
+  }
+
+  setMeta(key, value) {
+    this._stmts.setMeta.run(key, String(value));
+  }
+
+  /** Nodes of `kind` whose last name segment is `name` (`X::save`, `Y.save`). */
+  findMembersByName(subprojectId, name, kind = 'method') {
+    return this._stmts.findMembersByName.all(subprojectId, name, kind);
+  }
+
+  /** Classes, interfaces, traits and `@mixin`s a type extends, implements or uses. */
+  getInheritanceParents(nodeId) {
+    return this._stmts.findInheritanceParents.all(nodeId);
+  }
+
+  /** Types that extend, implement or use the given type. */
+  getInheritanceChildren(nodeId) {
+    return this._stmts.findInheritanceChildren.all(nodeId);
+  }
+
+  /** Files with a name-based reference keyed `key` (of `refKind`, or any). */
+  findPathsByUnresolvedKeys(subprojectId, keys, refKind = null) {
+    const paths = new Set();
+    for (const key of keys) {
+      const rows = refKind
+        ? this._stmts.findPathsByRefKind.all(subprojectId, key, refKind)
+        : this._stmts.findPathsByUnresolvedKey.all(subprojectId, key);
+      for (const row of rows) paths.add(row.source_path);
+    }
+    return [...paths];
   }
 
   clearEdges(subprojectId) {
@@ -419,30 +535,29 @@ export class GraphStore {
     if (kind) {
       const exact = this._stmts.locateBySymbolAndKind.all(subprojectId, symbol, kind);
       if (exact.length > 0) return exact;
-      return this._stmts.locateBySuffixAndKind.all(subprojectId, `%\\${symbol}`, kind);
+      return this._stmts.locateBySuffixAndKind.all(subprojectId, shortSymbol(symbol), `\\${symbol}`, `\\${symbol}`, kind);
     }
     const exact = this._stmts.locateBySymbol.all(subprojectId, symbol);
     if (exact.length > 0) return exact;
-    return this._stmts.locateBySuffix.all(subprojectId, `%\\${symbol}`);
+    // Namespace suffix match: `User` finds `App\Models\User`.
+    return this._stmts.locateBySuffix.all(subprojectId, shortSymbol(symbol), `\\${symbol}`, `\\${symbol}`);
   }
 
-  consumers(subprojectId, nodeId, maxDepth = parseInt(process.env.ORACLE_MAX_DEPTH || '5', 10)) {
-    const visited = new Set();
+  consumers(subprojectId, nodeId, maxDepth = positiveInt(process.env.ORACLE_MAX_DEPTH, 5)) {
+    const maxResults = positiveInt(process.env.ORACLE_MAX_TRAVERSAL_RESULTS, 1000);
+    const visited = new Set([nodeId]);
     const result = [];
     let frontier = [nodeId];
 
     for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
       const nextFrontier = [];
       for (const nid of frontier) {
-        if (visited.has(nid)) continue;
-        visited.add(nid);
-
-        const rows = this._stmts.consumersOneHop.all(nid);
-        for (const row of rows) {
-          if (!visited.has(row.id)) {
-            result.push({ ...row, depth: depth + 1 });
-            nextFrontier.push(row.id);
-          }
+        for (const row of this._stmts.consumersOneHop.all(nid)) {
+          if (visited.has(row.id)) continue;
+          visited.add(row.id);
+          result.push({ ...row, depth: depth + 1 });
+          if (result.length >= maxResults) return result;
+          nextFrontier.push(row.id);
         }
       }
       frontier = nextFrontier;
@@ -455,7 +570,8 @@ export class GraphStore {
     const visited = new Set(nodeIds);
     const result = [];
     let frontier = [...nodeIds];
-    const maxDepth = parseInt(process.env.ORACLE_MAX_DEPTH || '5', 10);
+    const maxDepth = positiveInt(process.env.ORACLE_MAX_DEPTH, 5);
+    const maxResults = positiveInt(process.env.ORACLE_MAX_TRAVERSAL_RESULTS, 1000);
 
     for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
       const nextFrontier = [];
@@ -465,6 +581,7 @@ export class GraphStore {
           if (!visited.has(row.id)) {
             visited.add(row.id);
             result.push({ ...row, depth: depth + 1 });
+            if (result.length >= maxResults) return result;
             nextFrontier.push(row.id);
           }
         }
@@ -490,8 +607,14 @@ export class GraphStore {
       this._stmts.clearSubproject.run(subprojectId);
       this._stmts.clearSubprojectNodes.run(subprojectId);
       this._stmts.clearSubprojectHashes.run(subprojectId);
+      this._stmts.clearSubprojectUnresolvedRefs.run(subprojectId);
     });
     run();
+  }
+
+  /** Marks every file of the subproject stale so the next build re-extracts it. */
+  forgetFileHashes(subprojectId) {
+    this._stmts.clearSubprojectHashes.run(subprojectId);
   }
 
   stats(subprojectId) {
@@ -533,6 +656,8 @@ export class GraphStore {
       commitSha: node.commitSha ?? node.commit_sha ?? null,
       fileBlobHash: node.fileBlobHash ?? node.file_blob_hash ?? null,
       metadata: node.metadata ? (typeof node.metadata === 'string' ? node.metadata : JSON.stringify(node.metadata)) : null,
+      shortSymbol: shortSymbol(node.symbol),
+      memberName: memberName(node.symbol),
     };
   }
 

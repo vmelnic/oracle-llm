@@ -8,6 +8,7 @@ import { GroundingWrapper } from '../grounding/index.js';
 import { estimateToonSavings } from '../grounding/toon.js';
 import { createParser } from '../parser/index.js';
 import { getSubprojectDir } from '../scanner/workspace.js';
+import { WeightsThenPatch } from '../l3/weights-patch.js';
 
 import { context } from '../mcp/tools/context.js';
 import { locate } from '../mcp/tools/locate.js';
@@ -31,6 +32,39 @@ export function estimateTokens(text) {
   return Math.ceil(str.length / 4);
 }
 
+/**
+ * Everything the MCP tool handlers need for one subproject, loaded from its
+ * ingested artifacts (graph, patterns, manifest, L2 index). L3 is left off;
+ * callers that want it set `ctx.l3`.
+ */
+export function loadToolContext(workspace, subprojectId) {
+  const subproject = workspace.subprojects.find(s => s.id === subprojectId);
+  const dir = getSubprojectDir(workspace.id, subprojectId);
+  const store = new GraphStore(path.join(dir, 'entity_graph.sqlite'));
+
+  const catalogue = new PatternCatalogue(store);
+  const cataloguePath = path.join(dir, 'pattern_catalog.json');
+  if (fs.existsSync(cataloguePath)) catalogue.load(cataloguePath);
+
+  const manifest = new ManifestDrafter().load(path.join(dir, 'manifest.yaml')) || {};
+
+  const l2 = new L2Index(store, { indexPath: path.join(dir, 'ast_embed_index') });
+  l2.load();
+
+  return {
+    store,
+    subproject,
+    grounding: new GroundingWrapper(store, { parser: createParser(), subprojectRoot: subproject.root }),
+    workspace,
+    patterns: catalogue,
+    manifest,
+    l2,
+    l3: null,
+    weightsPatch: new WeightsThenPatch(store, catalogue, manifest),
+    dir,
+  };
+}
+
 export class BenchmarkRunner {
   constructor(workspace, subprojectId) {
     this.workspace = workspace;
@@ -41,35 +75,7 @@ export class BenchmarkRunner {
   }
 
   _loadContext() {
-    if (this.ctx) return this.ctx;
-
-    const dir = getSubprojectDir(this.workspace.id, this.subprojectId);
-    const dbPath = path.join(dir, 'entity_graph.sqlite');
-    const store = new GraphStore(dbPath);
-
-    const catalogue = new PatternCatalogue(store);
-    const cataloguePath = path.join(dir, 'pattern_catalog.json');
-    if (fs.existsSync(cataloguePath)) catalogue.load(cataloguePath);
-
-    const drafter = new ManifestDrafter();
-    const manifest = drafter.load(path.join(dir, 'manifest.yaml')) || {};
-
-    const l2 = new L2Index(store, { indexPath: path.join(dir, 'ast_embed_index.json') });
-    l2.load();
-
-    const parser = createParser();
-
-    this.ctx = {
-      store,
-      subproject: this.subproject,
-      grounding: new GroundingWrapper(store, { parser, subprojectRoot: this.subproject.root }),
-      workspace: this.workspace,
-      patterns: catalogue,
-      manifest,
-      l2,
-      l3: null,
-      weightsPatch: null,
-    };
+    if (!this.ctx) this.ctx = loadToolContext(this.workspace, this.subprojectId);
     return this.ctx;
   }
 

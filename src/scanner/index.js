@@ -1,4 +1,4 @@
-import fg from 'fast-glob';
+import { globFiles } from '../utils/glob.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import yaml from 'js-yaml';
@@ -78,13 +78,41 @@ function tomlContainsDep(content, depName) {
   return content.includes(depName);
 }
 
+// package.json files of a JS monorepo's workspaces (npm/yarn `workspaces`,
+// pnpm-workspace.yaml). Patterns are expanded one directory level
+// (`apps/*`, `packages/**`), which covers the usual layouts.
+function workspacePackages(manifestDir, pkg) {
+  const patterns = [];
+  const declared = Array.isArray(pkg?.workspaces) ? pkg.workspaces : pkg?.workspaces?.packages;
+  if (Array.isArray(declared)) patterns.push(...declared);
+  const pnpm = readYaml(path.join(manifestDir, 'pnpm-workspace.yaml'));
+  if (Array.isArray(pnpm?.packages)) patterns.push(...pnpm.packages);
+  const dirs = new Set();
+  for (const pattern of patterns) {
+    if (typeof pattern !== 'string' || pattern.startsWith('!')) continue;
+    const base = pattern.replace(/\/\*\*?$/, '');
+    if (base === pattern) {
+      dirs.add(path.join(manifestDir, pattern));
+      continue;
+    }
+    try {
+      for (const entry of fs.readdirSync(path.join(manifestDir, base), { withFileTypes: true })) {
+        if (entry.isDirectory() && entry.name !== 'node_modules') dirs.add(path.join(manifestDir, base, entry.name));
+      }
+    } catch {}
+  }
+  return [...dirs].map(dir => readJson(path.join(dir, 'package.json'))).filter(Boolean);
+}
+
 function detectFramework(manifestName, manifestPath) {
   if (manifestName === 'package.json') {
-    const pkg = readJson(manifestPath);
-    if (hasDep(pkg, 'next')) return 'nextjs';
-    if (hasDep(pkg, 'vue')) return 'vue';
-    if (hasDep(pkg, 'react')) return 'react';
-    if (hasDep(pkg, 'express')) return 'express';
+    const root = readJson(manifestPath);
+    const pkgs = [root, ...workspacePackages(path.dirname(manifestPath), root)];
+    const uses = (dep) => pkgs.some(pkg => hasDep(pkg, dep));
+    if (uses('next')) return 'nextjs';
+    if (uses('vue')) return 'vue';
+    if (uses('react')) return 'react';
+    if (uses('express')) return 'express';
     return null;
   }
 
@@ -198,9 +226,11 @@ function defaultGlobs(language) {
 
 function detectLspConfig(language, framework, root) {
   if (language === 'typescript' || language === 'javascript') {
-    if (fs.existsSync(path.join(root, 'tsconfig.json')) || fs.existsSync(path.join(root, 'node_modules'))) {
+    if (fs.existsSync(path.join(root, 'tsconfig.json')) || fs.existsSync(path.join(root, 'jsconfig.json'))) {
       return {
-        cmd: 'npx typescript-language-server --stdio',
+        // `npx --no`: run an installed server only, never download one from
+        // the registry during a gate run.
+        cmd: 'npx --no typescript-language-server --stdio',
         init: { },
         root_markers: ['tsconfig.json', 'package.json', 'jsconfig.json'],
       };
@@ -245,13 +275,10 @@ export async function detectSubprojects(rootPath) {
   const absoluteRoot = fs.realpathSync(path.resolve(rootPath));
 
   const patterns = BUILD_MANIFESTS.map(m => `**/${m}`);
-  const entries = await fg(patterns, {
+  const entries = await globFiles(patterns, {
     cwd: absoluteRoot,
     ignore: DEFAULT_EXCLUDE,
     absolute: false,
-    onlyFiles: true,
-    dot: false,
-    followSymbolicLinks: false,
   });
 
   const safeEntries = entries.filter(entry => {
@@ -302,14 +329,37 @@ export async function detectSubprojects(rootPath) {
   });
 }
 
-export async function scanWorkspace(rootPath) {
+/**
+ * Detects the subprojects under `rootPath`. `only` (subproject ids, i.e.
+ * paths relative to the root) keeps just those; it is stored on the workspace
+ * so later re-scans apply the same selection. An id that is not detected is
+ * an error listing what was found.
+ */
+export async function scanWorkspace(rootPath, { only } = {}) {
   const absoluteRoot = fs.realpathSync(path.resolve(rootPath));
   const id = sanitizeId(path.basename(absoluteRoot));
-  const subprojects = await detectSubprojects(absoluteRoot);
+  const detected = await detectSubprojects(absoluteRoot);
 
+  const selection = normalizeSelection(only);
+  if (!selection) return { id, root: absoluteRoot, subprojects: detected };
+
+  const missing = selection.filter(sel => !detected.some(sp => sp.id === sel));
+  if (missing.length > 0) {
+    const found = detected.map(sp => sp.id).join(', ') || 'none';
+    throw new Error(`Subproject(s) not found: ${missing.join(', ')}. Detected: ${found}`);
+  }
   return {
     id,
     root: absoluteRoot,
-    subprojects,
+    only: selection,
+    subprojects: detected.filter(sp => selection.includes(sp.id)),
   };
+}
+
+function normalizeSelection(only) {
+  if (only == null) return null;
+  const list = (Array.isArray(only) ? only : String(only).split(','))
+    .map(s => String(s).trim().replace(/\\/g, '/').replace(/^\.\/+/, '').replace(/\/+$/, ''))
+    .filter(Boolean);
+  return list.length > 0 ? [...new Set(list)] : null;
 }

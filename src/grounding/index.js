@@ -1,11 +1,18 @@
 import fs from 'fs';
+import { positiveInt } from '../utils/env.js';
 import path from 'path';
 
+// Answer size caps in estimated tokens (ORACLE_TOKEN_CAP / _EXTENDED). Tools
+// whose answer is a list of places (users, impact, definitions) or a task
+// packet get the extended cap.
 const DEFAULT_TOKEN_CAP = 400;
 const EXTENDED_CAP_TOOLS = new Set([
   'oracle.where_would',
   'oracle.conventions_for',
   'oracle.context',
+  'oracle.consumers',
+  'oracle.impact',
+  'oracle.locate',
 ]);
 const EXTENDED_TOKEN_CAP = 1500;
 const NO_CAP_TOOLS = new Set([
@@ -17,55 +24,64 @@ function estimateTokens(obj) {
   return Math.ceil(json.length / 4);
 }
 
+/**
+ * Shrinks an answer to about `cap` tokens without dropping fields: long lists
+ * keep their first items and gain a `<field>_total` count, long strings are
+ * cut. Field order matters — earlier fields get the budget first.
+ */
 function truncateToTokenCap(obj, cap) {
   const json = JSON.stringify(obj);
-  const estimatedTokens = Math.ceil(json.length / 4);
-  if (estimatedTokens <= cap) return obj;
+  if (Math.ceil(json.length / 4) <= cap) return obj;
+  return shrink(JSON.parse(json), cap * 4);
+}
 
-  const maxChars = cap * 4;
-  const target = JSON.parse(JSON.stringify(obj));
-
-  function truncateValue(v, budget) {
-    if (typeof v === 'string') {
-      return v.slice(0, Math.max(0, Math.floor(budget) - 2));
+function shrink(value, budget) {
+  if (typeof value === 'string') return value.length + 2 <= budget ? value : `${value.slice(0, Math.max(0, budget - 5))}...`;
+  if (Array.isArray(value)) {
+    const out = [];
+    let used = 2;
+    for (const item of value) {
+      const size = JSON.stringify(item).length + 1;
+      // Items are kept whole or dropped: a half-kept record misleads.
+      if (used + size > budget) break;
+      out.push(item);
+      used += size;
     }
-    if (Array.isArray(v)) {
-      const result = [];
-      let used = 2; // []
-      for (const item of v) {
-        const itemJson = JSON.stringify(item);
-        if (used + itemJson.length + (result.length > 0 ? 1 : 0) > budget) break;
-        result.push(item);
-        used += itemJson.length + (result.length > 1 ? 1 : 0);
+    return out;
+  }
+  if (value && typeof value === 'object') {
+    const out = {};
+    let used = 2;
+    const entries = Object.entries(value);
+    for (let i = 0; i < entries.length; i++) {
+      const [key, val] = entries[i];
+      const keySize = JSON.stringify(key).length + 2;
+      const size = keySize + JSON.stringify(val).length;
+      // Leave room for the remaining keys' names so later fields survive too.
+      const reserve = entries.slice(i + 1).reduce((n, [k]) => n + JSON.stringify(k).length + 8, 0);
+      const room = budget - used - reserve;
+      if (size <= room) {
+        out[key] = val;
+        used += size;
+      } else if (room > keySize + 8 && val && typeof val === 'object') {
+        const shrunk = shrink(val, room - keySize);
+        out[key] = shrunk;
+        used += keySize + JSON.stringify(shrunk).length;
+        if (Array.isArray(val) && shrunk.length < val.length) {
+          out[`${key}_total`] = val.length;
+          used += JSON.stringify(`${key}_total`).length + 8;
+        }
+      } else if (room > keySize + 8 && typeof val === 'string') {
+        out[key] = shrink(val, room - keySize);
+        used += keySize + JSON.stringify(out[key]).length;
+      } else if (Array.isArray(val)) {
+        out[`${key}_total`] = val.length;
+        used += JSON.stringify(`${key}_total`).length + 8;
       }
-      return result;
     }
-    if (v && typeof v === 'object') {
-      const result = {};
-      let used = 2; // {}
-      for (const [k, val] of Object.entries(v)) {
-        const keyJson = JSON.stringify(k);
-        const valJson = JSON.stringify(val);
-        const sep = Object.keys(result).length > 0 ? 1 : 0;
-        if (used + sep + keyJson.length + 1 + valJson.length > budget) break;
-        result[k] = val;
-        used += sep + keyJson.length + 1 + valJson.length;
-      }
-      return result;
-    }
-    return v;
+    return out;
   }
-
-  let attempt = truncateValue(target, maxChars);
-  let safety = 10;
-  while (JSON.stringify(attempt).length > maxChars && safety-- > 0) {
-    attempt = truncateValue(target, maxChars - (10 - safety) * 100);
-  }
-
-  if (JSON.stringify(attempt).length > maxChars) {
-    return { truncated: true, token_estimate: estimatedTokens, cap };
-  }
-  return attempt;
+  return value;
 }
 
 export class GroundingWrapper {
@@ -73,6 +89,17 @@ export class GroundingWrapper {
     this.store = store;
     this.parser = parser;
     this.subprojectRoot = subprojectRoot || null;
+    // One wrapper serves one request: cache file text and parse trees so many
+    // evidence items in the same file cost one read and one parse.
+    this._files = new Map();
+  }
+
+  _file(resolved) {
+    if (!this._files.has(resolved)) {
+      const content = fs.readFileSync(resolved, 'utf-8');
+      this._files.set(resolved, { content, lines: content.split('\n'), trees: new Map() });
+    }
+    return this._files.get(resolved);
   }
 
   wrap(answer, toolName) {
@@ -102,27 +129,33 @@ export class GroundingWrapper {
       evidence: verified,
       confidence,
       layer: answer.layer || 'L1',
-      ...(answer._l3_synthesis ? { _l3_synthesis: answer._l3_synthesis } : {}),
+      ...l3Fields(answer),
       ...(failed.length > 0 ? { unverified_evidence: failed } : {}),
     };
 
     if (NO_CAP_TOOLS.has(toolName)) return result;
 
-    const cap = EXTENDED_CAP_TOOLS.has(toolName) ? EXTENDED_TOKEN_CAP : DEFAULT_TOKEN_CAP;
+    const cap = EXTENDED_CAP_TOOLS.has(toolName)
+      ? positiveInt(process.env.ORACLE_TOKEN_CAP_EXTENDED, EXTENDED_TOKEN_CAP)
+      : positiveInt(process.env.ORACLE_TOKEN_CAP, DEFAULT_TOKEN_CAP);
     const tokenEst = estimateTokens(result);
-    if (tokenEst > cap) {
-      const truncatedAnswer = truncateToTokenCap(result.answer, cap - 200);
+    const truncatedAnswer = tokenEst > cap ? truncateToTokenCap(result.answer, cap - 200) : result.answer;
+    // Only an answer that actually lost content is reported as truncated.
+    if (tokenEst > cap && JSON.stringify(truncatedAnswer) !== JSON.stringify(result.answer)) {
       result = {
         answer: truncatedAnswer,
-        evidence: verified.slice(0, 5),
+        // Evidence pointers are the cheap, valuable part of a big answer (a
+        // broad question can touch dozens of symbols): trim the body, keep
+        // the pointers up to ORACLE_MAX_EVIDENCE.
+        evidence: verified.slice(0, positiveInt(process.env.ORACLE_MAX_EVIDENCE, 50)),
         confidence: Math.min(confidence, 0.6),
         layer: answer.layer || 'L1',
-        ...(answer._l3_synthesis ? { _l3_synthesis: answer._l3_synthesis } : {}),
+        ...l3Fields(answer),
         _truncated: true,
         _token_estimate: tokenEst,
         _token_cap: cap,
         ...(failed.length > 0 ? { _unverified_evidence_count: failed.length } : {}),
-        _hint: 'Answer exceeds token cap. Use oracle.read_exact with evidence pointers for full content.',
+        _hint: 'Answer exceeds the token cap: lists were shortened (see *_total). Use oracle.read_exact with evidence pointers, narrow the query, or raise ORACLE_TOKEN_CAP / ORACLE_TOKEN_CAP_EXTENDED.',
       };
     }
 
@@ -149,30 +182,34 @@ export class GroundingWrapper {
         if (!Array.isArray(evidence.line_range) || evidence.line_range.length !== 2) return false;
         const [start, end] = evidence.line_range;
         if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 1 || start > end) return false;
-        const content = fs.readFileSync(resolved, 'utf-8');
-        const lines = content.split('\n');
+        const file = this._file(resolved);
+        const { content, lines } = file;
         if (end > lines.length) return false;
 
-        if (evidence.symbol) {
+        // Qualified symbols (`Class.method`, `App\\Models\\User`, `Foo::bar`) appear
+        // in source by their last segment only.
+        const symLower = evidence.symbol ? sourceName(evidence.symbol).toLowerCase() : '';
+        if (symLower) {
           const citedText = lines.slice(start - 1, end).join('\n').toLowerCase();
-          const symbol = String(evidence.symbol).toLowerCase();
-          if (!citedText.includes(symbol)) return false;
+          if (!citedText.includes(symLower)) return false;
         }
 
         if (this.parser && evidence.symbol) {
           const lang = this.parser.languageFor(resolved);
           if (lang) {
             try {
-              const tree = this.parser.parse(content, lang);
+              if (!file.trees.has(lang)) file.trees.set(lang, this.parser.parse(content, lang));
+              const tree = file.trees.get(lang);
               const rootStart = Math.max(0, start - 1);
               const rootEnd = Math.min(lines.length, end);
+              // End at the end of the last cited line: ending at column 0 of a
+              // single-line range selects only its first token (e.g. `export`).
               const nodeAtRange = tree.rootNode.descendantForPosition(
                 { row: rootStart, column: 0 },
-                { row: rootEnd - 1, column: 0 }
+                { row: rootEnd - 1, column: lines[rootEnd - 1].length }
               );
               if (nodeAtRange && !nodeAtRange.hasError) {
                 const nodeText = content.slice(nodeAtRange.startIndex, nodeAtRange.endIndex);
-                const symLower = (evidence.symbol || '').toLowerCase();
                 if (symLower && !nodeText.toLowerCase().includes(symLower)) {
                   return false;
                 }
@@ -209,6 +246,9 @@ export class GroundingWrapper {
 
     const selfConsistency = this._computeSelfConsistency(answer);
     confidence *= selfConsistency;
+
+    // A tool can cap its own confidence (e.g. a caller list with unbound call sites).
+    if (typeof answer.confidence_cap === 'number') confidence = Math.min(confidence, answer.confidence_cap);
 
     return Math.round(Math.min(confidence, 1.0) * 100) / 100;
   }
@@ -265,7 +305,9 @@ export class GroundingWrapper {
       'oracle.diff_since', 'oracle.impact',
     ]);
     if (!result.evidence || result.evidence.length === 0) {
-      if (EVIDENCE_OPTIONAL_TOOLS.has(toolName)) {
+      // An explicit negative ("no such symbol") claims nothing about the code,
+      // so it needs no evidence; only positive claims must be grounded.
+      if (EVIDENCE_OPTIONAL_TOOLS.has(toolName) || result.answer?.found === false) {
         return result;
       }
 
@@ -290,7 +332,7 @@ export class GroundingWrapper {
     return result;
   }
 
-  _retryFromL1(result, toolName) {
+  _retryFromL1(result, _toolName) {
     if (!this.store) return null;
 
     const answerObj = result.answer;
@@ -405,4 +447,16 @@ function extractFirstSymbol(answerObj) {
     if (Array.isArray(val) && val.length > 0 && val[0]?.symbol) return val[0].symbol;
   }
   return null;
+}
+
+function sourceName(symbol) {
+  const segments = String(symbol).split(/\\|::|\./).filter(Boolean);
+  return segments[segments.length - 1] || String(symbol);
+}
+
+// The synthesis travels with its untrusted-content note, never without it.
+function l3Fields(answer) {
+  return answer._l3_synthesis
+    ? { _l3_synthesis: answer._l3_synthesis, _l3_citations: answer._l3_citations, _l3_synthesis_note: answer._l3_synthesis_note }
+    : {};
 }

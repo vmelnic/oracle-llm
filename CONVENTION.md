@@ -5,7 +5,7 @@ Conventions for the llm-oracle codebase. Machine-readable reference for oracle m
 ## Language & Runtime
 
 - JavaScript ES modules (`"type": "module"`), no TypeScript, no build step
-- Node.js >= 20
+- Node.js >= 20.3
 - Imports use `import`/`export`, never `require`/`module.exports`
 
 ## Naming
@@ -42,11 +42,22 @@ Export named classes (`export class GraphStore`, `export class GroundingWrapper`
 
 - Parsers, detectors, and file-system reads swallow errors silently (`try { ... } catch {}`). Intentional — the oracle must be resilient to malformed/missing files.
 - Only validate at system boundaries (user input, external APIs). Internal code trusts framework guarantees.
+- Environment variables are a boundary: `validateEnv` (`src/utils/env.js`) checks them at CLI startup; read numbers with `positiveInt`/`nonNegativeInt`.
+- CLI commands throw `Error`s with user-facing messages; `bin/oracle.js` prints them and exits 1.
+
+## Prompts
+
+- Every text sent to a model is a template file: L3 prompts in `prompts/l3/*.txt` with Twig-style `{{placeholder}}` variables (rendered by `src/l3/prompts.js`; a missing value throws), MCP tool definitions in `prompts/mcp/tools.json`. No prompt text in JavaScript.
+
+## Logging
+
+- stdout is the MCP stdio channel. Outside `src/cli/` and `bin/`, log with `console.error` only (ESLint `no-console`).
 
 ## Database
 
 - SQLite via `better-sqlite3`, WAL mode, foreign keys enabled
-- Three tables: `nodes`, `edges`, `file_hashes`
+- Tables: `nodes`, `edges`, `file_hashes`, `unresolved_refs`, `schema_version`
+- Schema changes go in a new migration in `src/graph/migrations.js` (plus the CREATE in `schema.sql` for fresh databases)
 - Metadata stored as JSON strings; extractors pass plain objects, `GraphStore` serializes
 - `UNIQUE` constraints enforce idempotent upserts
 

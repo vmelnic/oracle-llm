@@ -312,7 +312,6 @@ function handleMethod(node, scope, ctx) {
 
   // Extract generic type references from parameters and return type
   if (params) {
-    const typeArgs = [];
     for (let i = 0; i < params.namedChildCount; i++) {
       const child = params.namedChild(i);
       if (child.type === 'formal_parameter') {

@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class SymfonyRouteDetector {
   async detect(subproject) {
     if (subproject.framework !== 'symfony') return [];
     const surfaces = [];
 
-    const routeFiles = await fg(
+    const routeFiles = await globFiles(
       ['config/routes.yaml', 'config/routes/*.yaml', 'config/routes.xml'],
       { cwd: subproject.root, absolute: true }
     );
@@ -21,7 +21,7 @@ export class SymfonyRouteDetector {
       });
     }
 
-    const controllers = await fg(
+    const controllers = await globFiles(
       ['src/Controller/**/*.php'],
       { cwd: subproject.root, absolute: true }
     );

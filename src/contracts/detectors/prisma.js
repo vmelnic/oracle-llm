@@ -1,11 +1,11 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class PrismaDetector {
   async detect(subproject) {
     const surfaces = [];
-    const prismaFiles = await fg(
+    const prismaFiles = await globFiles(
       ['prisma/schema.prisma', '**/schema.prisma'],
       { cwd: subproject.root, absolute: true }
     );

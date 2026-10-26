@@ -1,6 +1,5 @@
-import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class OpenApiDetector {
   async detect(subproject) {
@@ -10,7 +9,7 @@ export class OpenApiDetector {
       '**/openapi.{json,yaml,yml}',
       '**/swagger.{json,yaml,yml}',
     ];
-    const files = await fg(patterns, { cwd: subproject.root, absolute: true });
+    const files = await globFiles(patterns, { cwd: subproject.root, absolute: true });
     return files.map(f => ({
       path: path.relative(subproject.root, f),
       symbol: `openapi:${path.basename(f)}`,

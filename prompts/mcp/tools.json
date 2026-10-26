@@ -1,0 +1,551 @@
+[
+  {
+    "name": "oracle.locate",
+    "description": "Find definitions of a symbol. Returns definitions[] and references_count.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Symbol name to find"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Optional kind filter (function, class, method, route, component, etc.)"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "symbol"
+      ]
+    }
+  },
+  {
+    "name": "oracle.signature",
+    "description": "Get the signature, type info, and doc for a symbol or location.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "description": "File path (relative to subproject root)"
+        },
+        "line": {
+          "type": "number",
+          "description": "Line number"
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Symbol name (alternative to path+line)"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id"
+      ]
+    }
+  },
+  {
+    "name": "oracle.exists",
+    "description": "Search for something by description. Returns whether it exists and candidates.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string",
+          "description": "What to search for"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "description"
+      ]
+    }
+  },
+  {
+    "name": "oracle.nearby",
+    "description": "Find symbols near a location in a file, ranked by proximity and intent.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "line": {
+          "type": "number"
+        },
+        "intent": {
+          "type": "string",
+          "description": "What you are looking for"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "path",
+        "line"
+      ]
+    }
+  },
+  {
+    "name": "oracle.consumers",
+    "description": "Who uses a symbol: direct users with the exact call lines (method calls are resolved by receiver type, inheritance and imports), transitive users, callers reaching a method through the interface or parent it implements, its implementations, and possible call sites that static analysis could not bind (receiver of unknown type). `complete: false` means check possible_call_sites before concluding a symbol is unused.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string",
+          "description": "Symbol name (e.g. \"UserService::find\", \"GraphStore.locate\", \"useCart\") or node ID"
+        },
+        "kind": {
+          "type": "string",
+          "description": "Optional filter on the edge kind (calls, imports, renders, references, injects, extends...) or the user's kind"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "target"
+      ]
+    }
+  },
+  {
+    "name": "oracle.diff_since",
+    "description": "Show changed files and symbols since a git ref.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string",
+          "description": "Git ref (commit, branch, tag)"
+        },
+        "scope": {
+          "type": "string",
+          "description": "Optional scope filter"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "ref"
+      ]
+    }
+  },
+  {
+    "name": "oracle.conventions_for",
+    "description": "Get conventions for a topic: patterns, canonical examples, manifest rules.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "description": "Topic: migrations, auth, validation, errors, routing, state, etc."
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "topic"
+      ]
+    }
+  },
+  {
+    "name": "oracle.where_would",
+    "description": "Suggest where new code should be placed based on existing structure.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "intent": {
+          "type": "string",
+          "description": "What you want to create, e.g. \"user registration API\""
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "intent"
+      ]
+    }
+  },
+  {
+    "name": "oracle.pattern",
+    "description": "Look up a named pattern from the catalogue.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string",
+          "description": "Pattern name or kind"
+        },
+        "context": {
+          "type": "string",
+          "description": "Optional context for relevance ranking"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "name"
+      ]
+    }
+  },
+  {
+    "name": "oracle.impact",
+    "description": "Analyze impact of a proposed change. Returns breaking status, affected routes/components, migration needs, and for methods the callers through interfaces plus unresolved call sites to review.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "change": {
+          "type": "string",
+          "description": "Description of the change, e.g. \"add status column to orders\", \"change signature of UserService::find\""
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "change"
+      ]
+    }
+  },
+  {
+    "name": "oracle.validate",
+    "description": "Validate proposed code against conventions and patterns.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "description": "File path for the proposed code"
+        },
+        "proposed_code": {
+          "type": "string",
+          "description": "The code to validate"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "path",
+        "proposed_code"
+      ]
+    }
+  },
+  {
+    "name": "oracle.context",
+    "description": "Bundled discovery — the primary tool. Returns full task packet: existing files, suggested creates/modifies, DB schema, patterns, conventions, relevant code.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "task": {
+          "type": "string",
+          "description": "Task description, e.g. \"Add user registration\""
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "task"
+      ]
+    }
+  },
+  {
+    "name": "oracle.read_exact",
+    "description": "Read exact lines from a file. The only way to get verbatim code.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "description": "File path (relative to subproject root)"
+        },
+        "line_range": {
+          "type": "array",
+          "items": {
+            "type": "number"
+          },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[start_line, end_line]"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "path",
+        "line_range"
+      ]
+    }
+  },
+  {
+    "name": "oracle.stats",
+    "description": "Get node/edge counts by kind for debugging.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id"
+      ]
+    }
+  },
+  {
+    "name": "oracle.ingest",
+    "description": "Ingest (build/rebuild) entity graph, patterns, manifest, contracts, L2 index, and markdown docs for a workspace or subproject.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string",
+          "description": "Optional — ingests all subprojects if omitted"
+        },
+        "embeddings": {
+          "type": "boolean",
+          "description": "Enable semantic embeddings (default: env ORACLE_EMBEDDINGS)"
+        }
+      },
+      "required": [
+        "workspace_id"
+      ]
+    }
+  },
+  {
+    "name": "oracle.workspace_add",
+    "description": "Register a new workspace by scanning a directory for subprojects. Pass `subprojects` to keep only some of them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Absolute path to project root"
+        },
+        "subprojects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional subproject ids (paths relative to the root, e.g. \"backend\") to register; re-scans keep this selection. Omit to register every detected subproject."
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "oracle.workspace_scan",
+    "description": "Re-scan an existing workspace to detect new or removed subprojects.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subprojects": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Optional new subproject selection; omit to keep the saved one, [] to select all."
+        }
+      },
+      "required": [
+        "workspace_id"
+      ]
+    }
+  },
+  {
+    "name": "oracle.workspace_list",
+    "description": "List all registered workspaces and their subprojects.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    }
+  },
+  {
+    "name": "oracle.status",
+    "description": "Show layer status (L1/L2/L3), node/edge counts for workspaces and subprojects.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string",
+          "description": "Optional — shows all workspaces if omitted"
+        }
+      }
+    }
+  },
+  {
+    "name": "oracle.gate",
+    "description": "Run emit gate (pre-commit validation) on a proposed diff. Checks: parse errors, conventions, impact, tests.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        },
+        "diff": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": {
+                "type": "string"
+              },
+              "content": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "add",
+                  "modify",
+                  "delete"
+                ]
+              },
+              "deleted": {
+                "type": "boolean"
+              }
+            }
+          },
+          "description": "Array of {path, content} objects representing the proposed changes"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id",
+        "diff"
+      ]
+    }
+  },
+  {
+    "name": "oracle.manifest_show",
+    "description": "Show the manifest (framework, conventions, migrations, tests, etc.) for a subproject.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id"
+      ]
+    }
+  },
+  {
+    "name": "oracle.patterns_list",
+    "description": "List all patterns in the pattern catalogue for a subproject.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "workspace_id": {
+          "type": "string"
+        },
+        "subproject_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "subproject_id"
+      ]
+    }
+  }
+]

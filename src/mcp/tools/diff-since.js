@@ -14,29 +14,52 @@ export function diffSince(ctx, { ref, scope }) {
     return { answer: { changed_files: [], changed_symbols: [], summary: 'no project root found' }, evidence: [], layer: 'L1' };
   }
 
+  const fail = (summary) => ({
+    answer: { changed_files: [], changed_symbols: [], summary },
+    evidence: [],
+    layer: 'L1',
+  });
+  const git = (args) => execFileSync('git', args, {
+    cwd: root,
+    encoding: 'utf-8',
+    timeout: 10000,
+    maxBuffer: 16 * 1024 * 1024,
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+
+  try {
+    git(['rev-parse', '--is-inside-work-tree']);
+  } catch {
+    return fail('git not available or not a repository');
+  }
+  if (typeof ref !== 'string' || ref.length > 200 || /[\0\r\n]/.test(ref)) return fail(`invalid ref: ${String(ref).slice(0, 50)}`);
+  if (scope && (typeof scope !== 'string' || path.isAbsolute(scope) || path.relative(root, path.resolve(root, scope)).startsWith('..'))) {
+    return fail('invalid scope: must be a path inside the subproject');
+  }
+
+  let commit;
+  try {
+    commit = git(['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`]).trim();
+  } catch {
+    return fail(`unknown ref: ${ref}`);
+  }
+
   let changedFiles;
   try {
-    if (typeof ref !== 'string' || ref.length > 200 || /[\0\r\n]/.test(ref)) throw new Error('invalid ref');
-    const commit = execFileSync('git', ['rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`], {
-      cwd: root,
-      encoding: 'utf-8',
-      timeout: 10000,
-    }).trim();
-    const args = ['diff', '--no-ext-diff', '--name-only', commit, '--'];
-    if (scope) {
-      if (path.isAbsolute(scope) || path.relative(root, path.resolve(root, scope)).startsWith('..')) {
-        throw new Error('invalid scope');
-      }
-      args.push(scope);
-    }
-    const output = execFileSync('git', args, { cwd: root, encoding: 'utf-8', timeout: 10000 });
-    changedFiles = output.trim().split('\n').filter(Boolean);
+    // --relative: paths relative to (and limited to) the subproject root, which
+    // may be a subdirectory of the repository, matching how nodes are stored.
+    // --literal-pathspecs: `scope` is a plain path, so pathspec magic such as
+    // `:(top)` cannot widen the diff beyond the subproject.
+    const args = ['--literal-pathspecs', 'diff', '--no-ext-diff', '--relative', '--name-only', commit, '--'];
+    if (scope) args.push(scope);
+    const tracked = git(args).trim().split('\n').filter(Boolean);
+    // New files not yet committed are changes too; ls-files paths are already
+    // relative to the subproject root (cwd).
+    const untracked = git(['--literal-pathspecs', 'ls-files', '--others', '--exclude-standard', '--', ...(scope ? [scope] : [])])
+      .trim().split('\n').filter(Boolean);
+    changedFiles = [...new Set([...tracked, ...untracked])].sort();
   } catch {
-    return {
-      answer: { changed_files: [], changed_symbols: [], summary: 'git not available or not a repository' },
-      evidence: [],
-      layer: 'L1',
-    };
+    return fail(`git diff failed for ${ref}`);
   }
 
   if (changedFiles.length === 0) {
@@ -71,7 +94,7 @@ export function diffSince(ctx, { ref, scope }) {
     (kindParts.length > 0 ? `: ${kindParts.join(', ')}` : '');
 
   const evidence = changedSymbols.slice(0, 10).map(s => ({
-    path: path.join(root, s.path),
+    path: s.path,
     line_range: [s.start_line, s.end_line],
     symbol: s.symbol,
     kind: s.kind,

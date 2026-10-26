@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { positiveInt } from '../../utils/env.js';
 
 const LANG_MAP = {
   '.js': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript',
@@ -53,18 +54,26 @@ export function readExact(ctx, { path: filePath, line_range }) {
     return { answer: { error: err.message, path: filePath }, evidence: [], layer: 'L1' };
   }
 
+  // Errors echo the path as requested, never the resolved absolute path.
   if (!fs.existsSync(resolved)) {
-    return { answer: { error: 'file not found', path: resolved }, evidence: [], layer: 'L1' };
+    return { answer: { error: 'file not found', path: filePath }, evidence: [], layer: 'L1' };
   }
-  if (!fs.statSync(resolved).isFile()) {
-    return { answer: { error: 'path is not a regular file', path: resolved }, evidence: [], layer: 'L1' };
+  const fileStat = fs.statSync(resolved);
+  if (!fileStat.isFile()) {
+    return { answer: { error: 'path is not a regular file', path: filePath }, evidence: [], layer: 'L1' };
+  }
+  // Same ceiling as ingest: files above it were never indexed, and reading
+  // them whole just to slice a range could exhaust memory.
+  const maxFileBytes = positiveInt(process.env.ORACLE_MAX_FILE_BYTES, 5 * 1024 * 1024);
+  if (fileStat.size > maxFileBytes) {
+    return { answer: { error: 'file too large', path: filePath, max_file_bytes: maxFileBytes }, evidence: [], layer: 'L1' };
   }
 
   let content;
   try {
     content = fs.readFileSync(resolved, 'utf-8');
   } catch (err) {
-    return { answer: { error: 'read failed', message: err.message }, evidence: [], layer: 'L1' };
+    return { answer: { error: 'read failed', path: filePath, code: err.code || null }, evidence: [], layer: 'L1' };
   }
 
   const allLines = content.split('\n');
@@ -114,14 +123,21 @@ export function readExact(ctx, { path: filePath, line_range }) {
   const ext = path.extname(resolved).toLowerCase();
   const lang = LANG_MAP[ext] ?? null;
 
+  // Relative to the subproject, like every other tool's evidence; absolute
+  // paths would expose the server's directory layout.
+  const realBase = (() => {
+    try { return fs.realpathSync(subprojectRoot); } catch { return subprojectRoot; }
+  })();
+  const relPath = realBase ? path.relative(realBase, resolved).split(path.sep).join('/') : filePath;
+
   const evidence = [{
-    path: resolved,
+    path: relPath,
     line_range: [start, end],
   }];
 
   return {
     answer: {
-      path: resolved,
+      path: relPath,
       lines: selected,
       line_range: [start, end],
       total_lines: allLines.length,
@@ -130,9 +146,4 @@ export function readExact(ctx, { path: filePath, line_range }) {
     evidence,
     layer: 'L1',
   };
-}
-
-function positiveInt(value, fallback) {
-  const parsed = Number.parseInt(value || '', 10);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }

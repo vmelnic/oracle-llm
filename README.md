@@ -7,7 +7,8 @@ Three layers: **L1 deterministic** (entity graph, patterns, manifest, contracts)
 ## Install
 
 ```bash
-# Requires Node.js >= 20 and a C++ toolchain (for native deps)
+# Requires Node.js >= 20.3 and a C++ toolchain (for native deps)
+# @huggingface/transformers (local embeddings) is optional; installs without it still work
 npm install
 ```
 
@@ -30,7 +31,8 @@ node bin/oracle.js serve --transport http      # Streamable HTTP (http://127.0.0
 
 ## Configuration
 
-Copy `.env.example` to `.env`:
+Copy `.env.example` to `.env` (it is the complete, commented list of settings). Every `ORACLE_*`
+value is validated when the CLI starts; an invalid one stops it with a clear message.
 
 ```bash
 ORACLE_HOME=~/.oracle              # data directory
@@ -41,6 +43,7 @@ ORACLE_MCP_CACHE_SIZE=128          # LRU cache entries
 ORACLE_BM25_K1=1.2                 # BM25 tuning
 ORACLE_BM25_B=0.75
 ORACLE_MAX_DEPTH=5                 # graph traversal depth
+ORACLE_RESPECT_GITIGNORE=true      # skip git-ignored files when indexing
 ORACLE_OUTPUT_FORMAT=toon          # 'toon' (~35% fewer tokens) or 'json'
 
 # L2 semantic embeddings (optional, BM25-only by default)
@@ -52,25 +55,27 @@ ORACLE_EMBED_UNLOAD_TIMEOUT=300  # unload ONNX model after N seconds idle (0 = n
 # ORACLE_EMBED_API_KEY=your-api-key
 # ORACLE_EMBED_DIMENSIONS=1024
 
-# L3 neural synthesis (optional)
+# L3 synthesis (optional; any OpenAI-compatible backend, see docs/l3-local-model.md)
 ORACLE_L3_ENABLED=false
-# ORACLE_L3_BASE_URL=http://localhost:8321/v1
-# ORACLE_L3_MODEL=Qwen/Qwen2.5-Coder-3B-Instruct
-# ORACLE_L3_API_KEY=
+ORACLE_L3_BASE_URL=http://127.0.0.1:8321/v1
+ORACLE_L3_MODEL=Qwen3-4B-Instruct-2507-Q4_K_M
 ```
 
 HTTP is loopback-only by default. Binding to another interface requires
 an `ORACLE_MCP_AUTH_TOKEN` of at least 32 bytes and an explicit
 `ORACLE_MCP_ALLOWED_HOSTS` allowlist. Administrative MCP tools remain disabled over HTTP
 unless `ORACLE_MCP_ADMIN_ENABLED=true` and `ORACLE_ALLOWED_ROOTS` contains the
-canonical roots that may be registered. Put TLS and network policy in front of
+canonical roots that may be registered; over HTTP the same allowlist also limits which
+workspaces the query tools can read. `oracle.gate` executes the project's type-checker
+and tests on client-supplied code, so over HTTP it additionally requires
+`ORACLE_MCP_GATE_ENABLED=true`. Put TLS and network policy in front of
 the process for remote deployments; see `SECURITY.md` for the deployment baseline.
 
 ## CLI commands
 
 ```bash
 # Workspace management
-node bin/oracle.js workspace add <path>
+node bin/oracle.js workspace add <path> [--only api,web]   # --only keeps those subprojects
 node bin/oracle.js workspace list
 
 # Ingestion
@@ -98,100 +103,40 @@ node bin/oracle.js db reset <workspace_id> <subproject_id>
 
 # Efficiency benchmarking
 node bin/oracle.js benchmark <workspace_id> <subproject_id> [--output results.json]
+
+# Local model server for L3 (llama.cpp; see docs/l3-local-model.md)
+node bin/oracle.js llm download|start|status|stop
+node bin/oracle.js llm bench <workspace_id> <subproject_id>   # L3 speed + grounding acceptance
 ```
 
-## L3 Neural Synthesis
+## L3 synthesis (optional)
 
-Optional layer that augments open-ended tools (`context`, `where_would`, `conventions_for`) with natural-language synthesis from a local model. No fine-tuning required — L1 facts are injected into the model's system prompt, the model synthesizes around them, and WeightsThenPatch validates evidence against L1.
+With L3 on, `oracle.context`, `oracle.where_would` and `oracle.conventions_for`
+also return `_l3_synthesis`: a short answer written by a language model from
+the verified L1/L2 facts only, with `_l3_citations` pointing at the facts it
+used. The model cites facts by number; an answer citing anything that isn't a
+verified fact is dropped and the plain L1/L2 result is returned. Broad
+questions ("how does login work") consider every related symbol and its
+callers, not a fixed top few.
 
-Any OpenAI-compatible `/v1/chat/completions` endpoint works. Three options:
-
-### Option A: Ollama (recommended)
+It works with any OpenAI-compatible backend configured in `.env`. The repo can
+run a local llama.cpp server for it (you install llama.cpp; the oracle never
+installs software):
 
 ```bash
-# 1. Install Ollama (https://ollama.com)
-# 2. Pull a model
-ollama pull qwen3.5:9b
-
-# 3. Enable L3 in .env
-ORACLE_L3_ENABLED=true
-ORACLE_L3_BASE_URL=http://localhost:11434/v1
-ORACLE_L3_MODEL=qwen3.5:9b
-
-# 4. Start oracle MCP
-node bin/oracle.js serve
+brew install llama.cpp       # macOS; see the doc for other platforms and what this installs
+npm run llm:download         # Qwen3-4B-Instruct-2507 Q4_K_M, 2.3 GB, SHA-256 verified
+npm run llm:start            # 127.0.0.1:8321, OpenAI-compatible
+# .env: ORACLE_L3_ENABLED=true, then restart the MCP server
 ```
 
-### Option B: mlx-lm (Apple Silicon) or vllm (NVIDIA)
+On a base Apple M4 it answers in ~4.7 s (p50) with ~4.8 GB of memory (32K context; ~3.3 GB at 4K) and 100%
+of answers passing the grounding check. The same local model can drive the
+oracle's MCP tools as an agent through a harness such as [pi](https://pi.dev).
 
-```bash
-# 1. Set up Python venv and install model server
-python3 -m venv .venv
-source .venv/bin/activate
-pip install mlx-lm         # Apple Silicon (M1/M2/M3/M4)
-# pip install vllm          # NVIDIA GPU (CUDA)
-
-# 2. Start model server
-./scripts/serve-model.sh
-# or with options:
-./scripts/serve-model.sh --model Qwen/Qwen2.5-Coder-7B-Instruct --port 8321
-
-# 3. Enable L3 in .env
-ORACLE_L3_ENABLED=true
-ORACLE_L3_BASE_URL=http://localhost:8321/v1
-ORACLE_L3_MODEL=Qwen/Qwen2.5-Coder-3B-Instruct
-
-# 4. Start oracle MCP
-node bin/oracle.js serve
-```
-
-Factual tools always use L1 — the model is only used for synthesis on open-ended queries.
-
-### How it works
-
-The oracle injects L1 facts (entity graph nodes, patterns, conventions) into the model's system prompt. The model synthesizes natural language around those facts — it never invents paths or symbols. WeightsThenPatch validates every evidence pointer against L1 before returning.
-
-```
-User query: "How does the entity graph get built?"
-
-L1 retrieves:
-  - buildGraph: function, src/graph/builder.js:33-209
-  - GraphStore: class, src/graph/store.js:21-422
-  - createParser: function, src/parser/index.js:106-205
-
-Model receives L1 facts in system prompt → synthesizes:
-
-  "The entity graph is built incrementally from a file tree using the
-   buildGraph function in src/graph/builder.js:33-209."
-   evidence: [{"path": "src/graph/builder.js", "line_range": [33, 209]}]
-
-WeightsThenPatch validates evidence against L1 → ✓ all paths exist, line ranges match
-```
-
-### Direct model server test
-
-```bash
-# Verify model server is running
-curl -s http://localhost:8321/v1/models | python3 -m json.tool
-
-# Query with L1 context injection
-curl -s http://localhost:8321/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen2.5-Coder-3B-Instruct",
-    "messages": [
-      {"role": "system", "content": "You are a codebase oracle. Answer using ONLY the provided context. Be concise.\nEnd every answer with: evidence: [{\"path\": \"file/path\", \"line_range\": [start, end]}]\n\nContext:\n- authenticate: function, middleware/auth.js:5-32\n- verifyJwt: function, mcp-http.js:26-44"},
-      {"role": "user", "content": "Where is JWT verification handled?"}
-    ],
-    "max_tokens": 200,
-    "temperature": 0.1
-  }'
-
-# Response:
-# "JWT verification is handled in the authenticate function,
-#  which is a middleware located in middleware/auth.js at lines 5-32.
-#  evidence: [{"path": "middleware/auth.js", "line_range": [5, 32]}]"
-```
+Full guide (configuration, other backends, installed files and removal,
+measurements, prompt templates, agent setup):
+**[docs/l3-local-model.md](docs/l3-local-model.md)**.
 
 ## MCP tools (22 total)
 
@@ -205,7 +150,7 @@ Core tools require `workspace_id` + `subproject_id`. All return `{ answer, evide
 | `oracle.signature` | Signature + type info + doc for a symbol or `path:line` |
 | `oracle.exists` | Search by description. Returns `present`, `candidates[]` |
 | `oracle.nearby` | Symbols near a `path:line`, ranked by proximity and optional `intent` |
-| `oracle.consumers` | Transitive BFS consumers of a symbol |
+| `oracle.consumers` | Who uses a symbol: call lines, transitive users, callers through interfaces, implementations, possible call sites (`complete: false`) |
 | `oracle.diff_since` | Changed files + symbols since a git `ref` |
 
 ### Synthesis
@@ -214,7 +159,7 @@ Core tools require `workspace_id` + `subproject_id`. All return `{ answer, evide
 |------|-------------|
 | `oracle.context` | **Primary tool.** Full task packet: existing files, suggested creates/modifies, DB schema, patterns, conventions, relevant code |
 | `oracle.conventions_for` | Conventions for a `topic` (auth, routing, errors, validation, state, migrations) |
-| `oracle.where_would` | Suggest file placement for an `intent` (e.g. "therapist registration API") |
+| `oracle.where_would` | Suggest file placement for an `intent` (e.g. "user registration API") |
 | `oracle.pattern` | Look up a named pattern from the catalogue |
 
 ### Validation
@@ -276,6 +221,10 @@ node bin/oracle.js gate my-project backend --diff changes.json
 # Exit code 0 = committable, 1 = failed
 ```
 
+`changes.json` is `{ "files": [{ "path": "src/x.js", "proposed_code": "..." }] }` (or a bare
+array; `content` is accepted instead of `proposed_code`, and `"action": "delete"` removes a file).
+The MCP `oracle.gate` tool takes the same array as its `diff` argument.
+
 ## Benchmarking
 
 Measure oracle efficiency — tokens per query, latency, evidence accuracy:
@@ -295,14 +244,33 @@ On a 21-subproject workspace (10,184 nodes, 4,115 edges):
 | Latency | <160ms |
 | Evidence verification | 100% in the referenced sample |
 | Token reduction vs baseline | ~9x |
-| L3 synthesis accuracy | 100% in the referenced sample (Qwen2.5-Coder-3B-Instruct) |
 
 These historical sample results are not an SLA. Run `oracle benchmark` against
-the exact workspace, model, and commit used in a deployment.
+the exact workspace and commit used in a deployment. For L3, see the measured
+results in [docs/l3-local-model.md](docs/l3-local-model.md#measured-performance)
+and run `oracle llm bench`.
 
 ## Supported languages
 
 javascript, typescript, tsx, php, dart, vue, python, go, rust, java
+
+### How method calls are resolved (JS/TS, PHP, Dart)
+
+Static analysis, no type checker. A call `receiver.method()` is bound when the
+receiver's type can be told from the code: `this`/`self`/`static`/`parent`,
+typed parameters and properties (TS, PHP, Dart, JSDoc), PHP constructor
+promotion and `@var`, `new X()`, static calls, DI lookups (`app(X::class)`,
+`Get.find<X>()`, `context.read<X>()`), the declared return type of the call
+that produced the receiver, then the class itself or the nearest class,
+interface, trait or `@mixin` it inherits from. With the type unknown, a call is
+bound only when the receiver's name points at exactly one concrete class
+defining the method (`$userService->find()`, `store.getNode()`); otherwise it
+is kept as a *possible call site*. `oracle.consumers` reports those and sets
+`complete: false` instead of claiming a method is unused. Calls made through
+dynamic dispatch the code does not spell out (magic `__call` without a naming
+link, reflection, string callbacks) are not resolved.
+
+Python, Go, Rust and Java keep their earlier, simpler call extraction.
 
 ## Storage layout
 
@@ -315,17 +283,28 @@ javascript, typescript, tsx, php, dart, vue, python, go, rust, java
         backend/
           entity_graph.sqlite       # L1
           pattern_catalog.json      # L1
-          manifest.yaml             # L1
+          manifest.yaml             # L1 (safe to edit by hand)
+          manifest.drafted.yaml     # last auto-draft, baseline for the re-ingest merge
           contract_surfaces.json    # L1
           ast_embed_index/           # L2
-            bm25.json
-            vectors.json             # (optional, when embeddings enabled)
+            bm25.json                # BM25 + vector generation it pairs with
+            vectors.<gen>.bin        # (optional) Float32 embeddings
+            vectors.<gen>.meta.json  # (optional) ids, hashes, dimension
+  models/                           # GGUF models from `oracle llm download`
+  llm/                              # llama-server pid file and log
 ```
 
 ## Tests
 
 ```bash
 npm test
+npm run test:coverage   # with per-file coverage
+npm run lint            # ESLint
+npm run check           # lint + tests + knip + npm audit
 ```
 
-28 suites, 147 tests covering: benchmark, BM25, builder, contracts, emit-gate, graph-store, grounding, L3 inference, manifest, markdown, MCP tools, parser, patterns, retrieval (L2), scanner, toon, weights-patch, workspace.
+The suite covers: benchmark, BM25, builder, contracts, emit-gate, graph-store, grounding, L3 inference, manifest, markdown, MCP tools, parser, patterns, retrieval (L2), scanner, toon, weights-patch, workspace.
+
+## License
+
+MIT — see [LICENSE](LICENSE).

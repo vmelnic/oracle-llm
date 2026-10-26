@@ -21,7 +21,8 @@ export function statusCommand() {
       for (const id of ids) {
         const workspace = loadWorkspace(id);
         if (!workspace) {
-          console.log(`${id}: not found`);
+          console.error(`${id}: not found`);
+          process.exitCode = 1;
           continue;
         }
 

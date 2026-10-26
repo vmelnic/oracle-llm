@@ -5,9 +5,8 @@
  * Simplified for single-field documents (AST node summaries).
  */
 
-const DEFAULT_K1 = parseFloat(process.env.ORACLE_BM25_K1 || '1.2')
-const DEFAULT_B = parseFloat(process.env.ORACLE_BM25_B || '0.75')
-const EPSILON = 0.25
+const DEFAULT_K1 = envFloat(process.env.ORACLE_BM25_K1, 1.2)
+const DEFAULT_B = envFloat(process.env.ORACLE_BM25_B, 0.75)
 
 function tokenize(text) {
   if (!text) return []
@@ -22,6 +21,11 @@ function tokenize(text) {
     .filter((t) => t.length > 1)
 }
 
+function envFloat(value, fallback) {
+  const parsed = Number.parseFloat(value || '')
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback
+}
+
 function buildFrequencyMap(tokens) {
   const map = new Map()
   for (const t of tokens) {
@@ -34,7 +38,7 @@ export class Bm25Index {
   constructor({ k1 = DEFAULT_K1, b = DEFAULT_B } = {}) {
     this.k1 = k1
     this.b = b
-    this.documents = new Map() // id -> { tokens, length, node }
+    this.documents = new Map() // id -> { terms (unique), length, node }
     this.docCount = 0
     this.avgDocLen = 0
     this.totalDocLen = 0
@@ -51,7 +55,7 @@ export class Bm25Index {
     const length = tokens.length
     const freqMap = buildFrequencyMap(tokens)
 
-    this.documents.set(id, { tokens, length, node: nodeMeta })
+    this.documents.set(id, { terms: [...freqMap.keys()], length, node: nodeMeta })
     this.docCount++
     this.totalDocLen += length
     this.avgDocLen = this.totalDocLen / this.docCount
@@ -70,8 +74,7 @@ export class Bm25Index {
     const doc = this.documents.get(id)
     if (!doc) return
 
-    const freqMap = buildFrequencyMap(doc.tokens)
-    for (const [term] of freqMap) {
+    for (const term of doc.terms) {
       const postings = this.invertedIndex.get(term)
       if (postings) {
         postings.delete(id)
@@ -164,23 +167,27 @@ export class Bm25Index {
     this.invertedIndex = new Map()
     this.idfCache = new Map()
 
+    // Rebuild per-document terms and lengths in one pass over the postings.
+    const docTerms = new Map()
     if (data.invertedIndex) {
       for (const [term, postingsArr] of data.invertedIndex) {
         this.invertedIndex.set(term, new Map(postingsArr))
+        for (const [docId, freq] of postingsArr) {
+          let entry = docTerms.get(docId)
+          if (!entry) {
+            entry = { terms: [], length: 0 }
+            docTerms.set(docId, entry)
+          }
+          entry.terms.push(term)
+          entry.length += freq
+        }
       }
     }
 
     if (data.documents) {
       for (const { id, node } of data.documents) {
-        // Reconstruct tokens from inverted index for length bookkeeping
-        const tokens = []
-        for (const [term, postings] of this.invertedIndex) {
-          const freq = postings.get(id)
-          if (freq) {
-            for (let i = 0; i < freq; i++) tokens.push(term)
-          }
-        }
-        this.documents.set(id, { tokens, length: tokens.length, node })
+        const entry = docTerms.get(id) || { terms: [], length: 0 }
+        this.documents.set(id, { terms: entry.terms, length: entry.length, node })
       }
     }
   }

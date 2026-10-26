@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class LaravelRouteDetector {
   async detect(subproject) {
     if (subproject.framework !== 'laravel') return [];
     const surfaces = [];
 
-    const routeFiles = await fg(
+    const routeFiles = await globFiles(
       ['routes/*.php'],
       { cwd: subproject.root, absolute: true }
     );
@@ -46,7 +46,7 @@ export class LaravelRouteDetector {
       }
     }
 
-    const models = await fg(
+    const models = await globFiles(
       ['app/Models/*.php', 'app/*.php'],
       { cwd: subproject.root, absolute: true }
     );

@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class DoctrineMigrationDetector {
   async detect(subproject) {
     if (subproject.framework !== 'symfony') return [];
     const surfaces = [];
 
-    const migrations = await fg(
+    const migrations = await globFiles(
       ['migrations/**/*.php', 'src/Migrations/**/*.php', 'doctrine/migrations/**/*.php'],
       { cwd: subproject.root, absolute: true }
     );

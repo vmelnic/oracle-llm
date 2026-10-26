@@ -1,6 +1,8 @@
 node_modules/
 .venv/
 .env
+.env.*
+!.env.example
 *.log
 
 # Native build artifacts

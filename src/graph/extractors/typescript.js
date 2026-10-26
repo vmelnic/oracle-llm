@@ -1,32 +1,27 @@
 import {
-  walkTree,
-  walkBody,
-  handleClassBody,
-  handleMethodDefinition,
   handleImportStatement,
   handleCallExpression,
   handleExportStatement,
   classifyFunction,
   extractJsxRendering,
   extractEnvAccess,
-  cleanStringLiteral,
   extractLeadingDoc,
   isFunctionNode,
   scopedSymbol,
   nodeHasChild,
   findChildOfType,
-  firstNonTrivialChild,
-  containsNodeType,
   extractSuperclass,
   makeLangNode,
   makeLangEdge,
-  HTTP_METHODS,
+  handleModuleVariable,
+  collectImportedNames,
+  extractValueReference,
 } from './javascript.js';
 
 export function extract(tree, filePath, subprojectId) {
   const nodes = [];
   const edges = [];
-  const ctx = { filePath, subprojectId, lang: 'typescript', nodes, edges };
+  const ctx = { filePath, subprojectId, lang: 'typescript', nodes, edges, importedNames: collectImportedNames(tree.rootNode) };
 
   walkTs(tree.rootNode, null, ctx);
 
@@ -141,9 +136,11 @@ function extractInterfaceMembers(body, interfaceName, ctx) {
         const typeAnno = findChildOfType(child, 'type_annotation');
         const returnType = typeAnno ? typeAnno.text.replace(/^:\s*/, '') : null;
 
+        // A property is callable (`props.onSave()`) only when its type is a function.
+        const callable = child.type === 'method_signature' || typeAnno?.namedChild(0)?.type === 'function_type';
         ctx.nodes.push(makeNode(ctx, {
           symbol: `${interfaceName}.${memberName}`,
-          kind: 'method',
+          kind: callable ? 'method' : 'property',
           parent_symbol: interfaceName,
           start_line: child.startPosition.row + 1,
           end_line: child.endPosition.row + 1,
@@ -392,7 +389,6 @@ function handleTsFieldDefinition(node, className, ctx) {
 
   const name = nameNode.text;
   const value = node.childForFieldName('value');
-  const typeAnno = findChildOfType(node, 'type_annotation');
   const decorators = collectDecorators(node);
 
   if (value && isFunctionNode(value)) {
@@ -497,7 +493,11 @@ function handleTsVariableDeclaration(node, scope, ctx, exported) {
     if (isFunctionNode(value)) {
       handleTsArrowOrFunctionExpression(name, value, scope, ctx, exported, node, typeAnno);
     } else if (value.type === 'call_expression') {
-      handleTsVariableCallExpression(name, value, scope, ctx, exported, node);
+      if (!handleTsVariableCallExpression(name, value, scope, ctx, exported, node) && !scope) {
+        handleModuleVariable(name, value, ctx, exported, node, walkTsBody, typeAnno);
+      }
+    } else if (!scope) {
+      handleModuleVariable(name, value, ctx, exported, node, walkTsBody, typeAnno);
     }
   }
 }
@@ -536,9 +536,10 @@ function handleTsArrowOrFunctionExpression(name, fnNode, scope, ctx, exported, d
   }
 }
 
+/** Returns true when the declaration was recognised (function, component, store). */
 function handleTsVariableCallExpression(name, callNode, scope, ctx, exported, declNode) {
   const callee = callNode.childForFieldName('function');
-  if (!callee) return;
+  if (!callee) return false;
 
   const calleeName = callee.text;
 
@@ -554,7 +555,7 @@ function handleTsVariableCallExpression(name, callNode, scope, ctx, exported, de
       doc: extractLeadingDoc(declNode),
       metadata: { vue: true },
     }));
-    return;
+    return true;
   }
 
   const args = callNode.childForFieldName('arguments');
@@ -563,10 +564,11 @@ function handleTsVariableCallExpression(name, callNode, scope, ctx, exported, de
       const arg = args.child(i);
       if (isFunctionNode(arg)) {
         handleTsArrowOrFunctionExpression(name, arg, scope, ctx, exported, declNode, null);
-        return;
+        return true;
       }
     }
   }
+  return false;
 }
 
 function handleTsExpressionStatement(node, scope, ctx) {
@@ -597,6 +599,10 @@ function walkTsBodyRecursive(node, scope, ctx) {
 
   if (node.type === 'member_expression') {
     extractEnvAccess(node, scope, ctx);
+  }
+
+  if (node.type === 'identifier' || node.type === 'shorthand_property_identifier') {
+    extractValueReference(node, scope, ctx);
   }
 
   if (node.type === 'jsx_element' || node.type === 'jsx_self_closing_element') {

@@ -1,0 +1,1 @@
+[{{id}}] {{caller}} renders {{callee}} (line {{line}} of {{path}})

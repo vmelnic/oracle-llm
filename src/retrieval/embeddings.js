@@ -1,8 +1,10 @@
+import { nonNegativeInt } from '../utils/env.js'
+
 let _extractor = null
 let _loading = null
 let _idleTimer = null
 
-const UNLOAD_TIMEOUT = parseInt(process.env.ORACLE_EMBED_UNLOAD_TIMEOUT || '300', 10)
+const UNLOAD_TIMEOUT = nonNegativeInt(process.env.ORACLE_EMBED_UNLOAD_TIMEOUT, 300)
 
 function _resetIdleTimer() {
   if (UNLOAD_TIMEOUT <= 0) return

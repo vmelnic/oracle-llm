@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "oracle": {
+      "command": "node",
+      "args": ["/absolute/path/to/llm-oracle/bin/oracle.js", "serve"],
+      "exposure": "direct"
+    }
+  }
+}

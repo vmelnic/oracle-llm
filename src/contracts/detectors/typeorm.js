@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class TypeOrmDetector {
   async detect(subproject) {
     const surfaces = [];
-    const ormFiles = await fg(
+    const ormFiles = await globFiles(
       ['**/*.entity.{ts,js}', '**/entities/**/*.{ts,js}', '**/entity/**/*.{ts,js}'],
-      { cwd: subproject.root, absolute: true, ignore: ['node_modules/**'] }
+      { cwd: subproject.root, absolute: true }
     );
 
     for (const f of ormFiles) {

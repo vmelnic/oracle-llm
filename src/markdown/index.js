@@ -2,8 +2,10 @@ import fs from 'fs';
 import path from 'path';
 import fg from 'fast-glob';
 
-const CONVENTION_FILES = ['CONVENTIONS.md', 'CLAUDE.md', 'CODING.md', 'STYLE.md'];
+const CONVENTION_FILES = ['CONVENTIONS.md', 'CONVENTION.md', 'AGENTS.md', 'CLAUDE.md', 'CODING.md', 'STYLE.md'];
 const DOC_FILES = ['README.md', 'ARCHITECTURE.md', 'API.md', 'SETUP.md'];
+const MAX_RULES_PER_SECTION = 20;
+const MAX_RULE_LENGTH = 300;
 
 export function parseMarkdown(content) {
   const sections = [];
@@ -114,7 +116,7 @@ function extractBullets(lines) {
     .map(l => l.replace(/^\s*[-*+]\s+/, '').trim());
 }
 
-function slugify(str) {
+export function slugify(str) {
   return str
     .replace(/\*\*/g, '')
     .replace(/`/g, '')
@@ -160,6 +162,12 @@ export function extractConventionRules(sections) {
           if (!conventions[sectionKey]) conventions[sectionKey] = {};
           conventions[sectionKey][key] = value;
         }
+      } else if (bullet.trim().length >= 10) {
+        // Prose rules ("Parsers swallow errors silently ...") are the
+        // conventions themselves; keep them, bounded.
+        if (!conventions[sectionKey]) conventions[sectionKey] = {};
+        const rules = conventions[sectionKey]._rules || (conventions[sectionKey]._rules = []);
+        if (rules.length < MAX_RULES_PER_SECTION) rules.push(bullet.trim().slice(0, MAX_RULE_LENGTH));
       }
     }
 
@@ -214,7 +222,8 @@ export function extractConventionsFromFiles(root) {
         if (typeof value === 'object' && !merged[key]) {
           merged[key] = { ...value, _source: source };
         } else if (typeof value === 'object') {
-          merged[key] = { ...merged[key], ...value };
+          const rules = [...(merged[key]._rules || []), ...(value._rules || [])];
+          merged[key] = { ...merged[key], ...value, ...(rules.length ? { _rules: rules.slice(0, MAX_RULES_PER_SECTION) } : {}) };
         } else {
           merged[key] = value;
         }
@@ -226,6 +235,11 @@ export function extractConventionsFromFiles(root) {
 }
 
 export function processMarkdownFiles(subproject, store) {
+  const run = () => processMarkdownFilesInternal(subproject, store);
+  return typeof store.runInTransaction === 'function' ? store.runInTransaction(run) : run();
+}
+
+function processMarkdownFilesInternal(subproject, store) {
   const { id: subprojectId, root } = subproject;
   const allFiles = [...findConventionFiles(root), ...findDocFiles(root)];
   const unique = [...new Set(allFiles)];

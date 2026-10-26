@@ -1,12 +1,12 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class DatabaseSchemaDetector {
   async detect(subproject) {
     const surfaces = [];
 
-    const migrations = await fg(
+    const migrations = await globFiles(
       [
         'migrations/**/*.{php,sql,js,ts,py}',
         'database/migrations/**/*.php',
@@ -34,7 +34,7 @@ export class DatabaseSchemaDetector {
       }
     }
 
-    const schemaDumps = await fg(
+    const schemaDumps = await globFiles(
       ['schema.sql', 'database/schema/*.sql', 'dump.sql'],
       { cwd: subproject.root, absolute: true }
     );

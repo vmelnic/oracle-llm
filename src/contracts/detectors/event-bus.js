@@ -1,18 +1,18 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { capFiles, globFiles } from '../../utils/glob.js';
 
 export class EventBusDetector {
   async detect(subproject) {
     const surfaces = [];
-    const codeFiles = await fg(
+    const codeFiles = await globFiles(
       ['**/*.{php,js,ts,java,py,go,dart}'],
-      { cwd: subproject.root, absolute: true, ignore: ['node_modules/**', 'vendor/**'] }
+      { cwd: subproject.root, absolute: true, ignore: ['**/vendor/**'] }
     );
 
     const seenEvents = new Map();
 
-    for (const f of codeFiles.slice(0, 500)) {
+    for (const f of capFiles(codeFiles, 'event-bus')) {
       const content = fs.readFileSync(f, 'utf-8');
 
       const eventPatterns = [
@@ -31,6 +31,8 @@ export class EventBusDetector {
         let m;
         while ((m = pat.exec(content)) !== null) {
           const eventName = m[1];
+          // Annotation-only patterns (e.g. @EventListener) carry no event name.
+          if (!eventName) continue;
           if (!seenEvents.has(eventName)) {
             seenEvents.set(eventName, {
               path: path.relative(subproject.root, f),

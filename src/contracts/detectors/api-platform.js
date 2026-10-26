@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class ApiPlatformDetector {
   async detect(subproject) {
     if (subproject.framework !== 'symfony') return [];
     const surfaces = [];
 
-    const phpFiles = await fg(
+    const phpFiles = await globFiles(
       ['src/Entity/**/*.php', 'src/ApiResource/**/*.php', 'src/Model/**/*.php'],
       { cwd: subproject.root, absolute: true }
     );

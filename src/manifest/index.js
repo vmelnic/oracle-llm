@@ -31,18 +31,15 @@ export class ManifestDrafter {
     return yaml.load(fs.readFileSync(manifestPath, 'utf-8'));
   }
 
-  merge(existing, drafted) {
-    const merged = { ...drafted };
-    for (const [key, value] of Object.entries(existing)) {
-      if (value !== null && value !== undefined) {
-        if (typeof value === 'object' && !Array.isArray(value) && typeof merged[key] === 'object') {
-          merged[key] = { ...merged[key], ...value };
-        } else {
-          merged[key] = value;
-        }
-      }
-    }
-    return merged;
+  /**
+   * Three-way merge of the manifest on re-ingest. `previousDraft` is what the
+   * drafter produced last time: a value the user left as drafted is refreshed
+   * from the new draft, a value the user edited is kept. Without a previous
+   * draft (older installs) user values win, except derived `_`-prefixed keys
+   * such as `_from_docs`, which are always refreshed.
+   */
+  merge(existing, drafted, previousDraft = null) {
+    return mergeManifest(existing, drafted, previousDraft);
   }
 }
 
@@ -327,6 +324,10 @@ async function detectTestFrameworks(subproject) {
       const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
       if (allDeps.mocha && !frameworks.includes('mocha')) frameworks.push('mocha');
       if (allDeps.ava && !frameworks.includes('ava')) frameworks.push('ava');
+      // Node's built-in runner has no dependency to detect; the test script reveals it.
+      if (/\bnode\s+(?:[^|&;]*\s)?--test\b/.test(pkg.scripts?.test || '') && !frameworks.includes('node-test')) {
+        frameworks.push('node-test');
+      }
     } catch {}
   }
 
@@ -344,7 +345,7 @@ async function detectTestFrameworks(subproject) {
 }
 
 async function detectEntryPoints(subproject) {
-  const { root, framework, language } = subproject;
+  const { root, framework } = subproject;
   const entries = [];
 
   const candidates = {
@@ -515,4 +516,28 @@ async function detectEmailHandling(root, framework, conventions) {
   if (total > 0 && lowercaseCount > total * 0.3) {
     conventions.email_handling = 'lowercase-before-store';
   }
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function deepEqual(a, b) {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+function mergeManifest(existing, drafted, previousDraft) {
+  const merged = { ...drafted };
+  for (const [key, value] of Object.entries(existing || {})) {
+    if (value === null || value === undefined) continue;
+    const hasPrevious = isPlainObject(previousDraft) && key in previousDraft;
+    if (key.startsWith('_') && !hasPrevious) continue; // derived: take the new draft
+    if (hasPrevious && deepEqual(value, previousDraft[key])) continue; // untouched by the user
+    if (isPlainObject(value) && isPlainObject(drafted?.[key])) {
+      merged[key] = mergeManifest(value, drafted[key], hasPrevious ? previousDraft[key] : null);
+    } else {
+      merged[key] = value; // edited (or added) by the user
+    }
+  }
+  return merged;
 }

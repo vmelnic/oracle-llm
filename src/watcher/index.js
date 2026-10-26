@@ -1,18 +1,15 @@
 import fs from 'fs';
 import path from 'path';
-import { buildGraph } from '../graph/builder.js';
 import { createParser } from '../parser/index.js';
 import { GraphStore } from '../graph/store.js';
-import { PatternCatalogue } from '../patterns/index.js';
 import { L2Index } from '../retrieval/index.js';
-import { createContractRegistry } from '../contracts/index.js';
-import { ManifestDrafter } from '../manifest/index.js';
-import { processMarkdownFiles } from '../markdown/index.js';
 import { getSubprojectDir } from '../scanner/workspace.js';
 import { acquireFileLock } from '../utils/file-lock.js';
 import { markIngestState } from '../ingest/state.js';
+import { runIngestPipeline } from '../ingest/pipeline.js';
 
 const DEBOUNCE_MS = 500;
+const LOCKED_RETRY_MS = 5000;
 
 export class FileWatcher {
   constructor({ workspace, subproject }) {
@@ -23,10 +20,10 @@ export class FileWatcher {
     this.pending = new Map();
     this.store = null;
     this.l2 = null;
-    this.patterns = null;
     this.dir = null;
     this.debounceTimer = null;
     this.processing = false;
+    this.stopped = false;
     this.onReindex = null;
   }
 
@@ -38,11 +35,7 @@ export class FileWatcher {
     const dbPath = path.join(this.dir, 'entity_graph.sqlite');
     this.store = new GraphStore(dbPath);
 
-    const cataloguePath = path.join(this.dir, 'pattern_catalog.json');
-    this.patterns = new PatternCatalogue(this.store);
-    if (fs.existsSync(cataloguePath)) this.patterns.load(cataloguePath);
-
-    this.l2 = new L2Index(this.store, { indexPath: path.join(this.dir, 'ast_embed_index.json') });
+    this.l2 = new L2Index(this.store, { indexPath: path.join(this.dir, 'ast_embed_index') });
     this.l2.load();
 
     const includeGlobs = sp.includeGlobs || sp.include_globs || ['**/*'];
@@ -67,6 +60,11 @@ export class FileWatcher {
 
           this._scheduleReindex(fullPath, eventType);
         });
+        watcher.on('error', (err) => {
+          console.error(`[watch] watcher error on ${dir}: ${err.message}`);
+          try { watcher.close(); } catch {}
+          this.watchers = this.watchers.filter((w) => w !== watcher);
+        });
         this.watchers.push(watcher);
       } catch (err) {
         console.error(`[watch] failed to watch ${dir}: ${err.message}`);
@@ -84,7 +82,9 @@ export class FileWatcher {
       'var', 'public/builder', 'public/assets', '__pycache__',
       '.next', '.nuxt', 'target', 'bin', 'obj',
     ];
-    const parts = filePath.split(path.sep);
+    // Only segments inside the subproject count: a project living under e.g.
+    // ~/build/ must not have every event ignored.
+    const parts = relativePath.split('/');
     for (const part of parts) {
       if (defaultExclude.includes(part)) return true;
     }
@@ -93,6 +93,7 @@ export class FileWatcher {
   }
 
   _scheduleReindex(filePath, eventType) {
+    if (this.stopped) return;
     this.pending.set(filePath, eventType);
     if (this.processing) return;
     if (this.debounceTimer) clearTimeout(this.debounceTimer);
@@ -100,7 +101,7 @@ export class FileWatcher {
   }
 
   async _processPending() {
-    if (this.processing) return;
+    if (this.processing || this.stopped) return;
     this.processing = true;
     const changed = new Map(this.pending);
     this.pending.clear();
@@ -113,66 +114,51 @@ export class FileWatcher {
 
     const changedFiles = [...changed.keys()];
     const relativePaths = changedFiles.map(f => path.relative(this.subproject.root, f));
+    let retryDelay = DEBOUNCE_MS;
 
     try {
       const lock = acquireFileLock(path.join(this.dir, '.ingest.lock'));
       try {
         markIngestState(this.dir, 'building');
-
-        // A changed definition can invalidate incoming edges from unchanged files,
-        // so hash-scan the project and rebuild graph edges as one transaction.
-        const graphStats = await buildGraph(this.subproject, this.parser, this.store);
-
-        const contracts = createContractRegistry(this.store);
-        const surfacesPath = path.join(this.dir, 'contract_surfaces.json');
-        const previousSurfaces = contracts.loadSurfacesJson(surfacesPath);
-        const contractStats = await contracts.index(this.subproject, { previousSurfaces });
-        contracts.saveSurfacesJson(contractStats.surfaces, surfacesPath);
-
-        processMarkdownFiles(this.subproject, this.store);
-
-        this.patterns.extract(this.subproject);
-        this.patterns.rerank(relativePaths);
-        const cataloguePath = path.join(this.dir, 'pattern_catalog.json');
-        this.patterns.save(cataloguePath);
-
-        await this.l2.build(this.subproject.id);
-        this.l2.save();
-
-        const drafter = new ManifestDrafter();
-        const manifestPath = path.join(this.dir, 'manifest.yaml');
-        const existing = drafter.load(manifestPath);
-        const drafted = await drafter.draft(this.subproject);
-        await drafter.save(existing ? drafter.merge(existing, drafted) : drafted, manifestPath);
-
-        const storeStats = this.store.stats(this.subproject.id);
+        const stats = await runIngestPipeline({
+          subproject: this.subproject,
+          dir: this.dir,
+          store: this.store,
+          parser: this.parser,
+          changedPaths: relativePaths,
+          l2: this.l2,
+        });
         if (this.onReindex) {
           this.onReindex({
             files: relativePaths,
-            nodesCreated: graphStats.nodesCreated,
-            edgesCreated: graphStats.edgesCreated,
+            nodesCreated: stats.graph.nodesCreated,
+            edgesCreated: stats.graph.edgesCreated,
           });
         }
-        markIngestState(this.dir, 'ready', { nodes: storeStats.totalNodes, edges: storeStats.totalEdges });
+        markIngestState(this.dir, 'ready', { nodes: stats.totals.totalNodes, edges: stats.totals.totalEdges });
       } finally {
         lock.release();
       }
     } catch (err) {
       if (err.code === 'ORACLE_LOCKED') {
+        // Another ingest is running: keep the events and retry later, quietly.
         for (const [filePath, eventType] of changed) this.pending.set(filePath, eventType);
+        retryDelay = LOCKED_RETRY_MS;
+        console.error(`[watch] ${this.subproject.id}: another ingest is running; retrying in ${LOCKED_RETRY_MS / 1000}s`);
       } else {
         markIngestState(this.dir, 'failed', { error: err.message });
+        console.error(`[watch] reindex failed for ${this.subproject.id}: ${process.env.ORACLE_DEBUG === 'true' ? err.stack : err.message}`);
       }
-      console.error(`[watch] reindex failed for ${this.subproject.id}: ${err.stack || err.message}`);
     } finally {
       this.processing = false;
-      if (this.pending.size > 0) this._scheduleReindexTimer();
+      if (this.stopped) this._closeStore();
+      else if (this.pending.size > 0) this._scheduleReindexTimer(retryDelay);
     }
   }
 
-  _scheduleReindexTimer() {
-    if (this.debounceTimer || this.processing) return;
-    this.debounceTimer = setTimeout(() => this._processPending(), DEBOUNCE_MS);
+  _scheduleReindexTimer(delay = DEBOUNCE_MS) {
+    if (this.debounceTimer || this.processing || this.stopped) return;
+    this.debounceTimer = setTimeout(() => this._processPending(), delay);
   }
 
   stop() {
@@ -184,6 +170,12 @@ export class FileWatcher {
       try { w.close(); } catch {}
     }
     this.watchers = [];
+    this.stopped = true;
+    // A reindex in flight still needs the store; it closes it when done.
+    if (!this.processing) this._closeStore();
+  }
+
+  _closeStore() {
     if (this.store) {
       try { this.store.close(); } catch {}
       this.store = null;

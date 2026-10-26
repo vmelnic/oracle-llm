@@ -46,13 +46,19 @@ export class ContractRegistry {
     const surfaces = this.scanHadErrors
       ? mergeSurfaces(previousSurfaces, detectedSurfaces)
       : detectedSurfaces;
+    const write = () => this._writeSurfaces(subproject, previousSurfaces, surfaces);
+    if (typeof this.store.runInTransaction === 'function') this.store.runInTransaction(write);
+    else write();
+    return { surfacesIndexed: surfaces.length, surfaces, scanIncomplete: this.scanHadErrors };
+  }
+
+  _writeSurfaces(subproject, previousSurfaces, surfaces) {
     if (!this.scanHadErrors) {
       this._removeStaleSurfaces(subproject.id, previousSurfaces, surfaces);
     }
 
     for (const surface of surfaces) {
-      const startLine = surface.startLine ?? surface.start_line ?? 0;
-      const endLine = surface.endLine ?? surface.end_line ?? 0;
+      const { startLine, endLine } = surfaceLines(surface);
       const existing = this.store.getNodesByFile?.(subproject.id, surface.path)
         ?.find(node => node.symbol === surface.symbol && node.kind === surface.kind && node.start_line === startLine);
       const existingMetadata = parseMetadata(existing?.metadata);
@@ -83,7 +89,6 @@ export class ContractRegistry {
         metadata,
       });
     }
-    return { surfacesIndexed: surfaces.length, surfaces, scanIncomplete: this.scanHadErrors };
   }
 
   _removeStaleSurfaces(subprojectId, previousSurfaces, currentSurfaces) {
@@ -93,7 +98,7 @@ export class ContractRegistry {
     const currentKeys = new Set(currentSurfaces.map(surface => surfaceKey(surface)));
     for (const previous of previousSurfaces) {
       if (currentKeys.has(surfaceKey(previous))) continue;
-      const startLine = previous.startLine ?? previous.start_line ?? 0;
+      const { startLine } = surfaceLines(previous);
       const node = this.store.getNodesByFile(subprojectId, previous.path)
         .find(candidate => candidate.symbol === previous.symbol
           && candidate.kind === previous.kind
@@ -118,8 +123,8 @@ export class ContractRegistry {
       kind: s.kind,
       path: s.path,
       lang: s.lang,
-      start_line: s.startLine ?? s.start_line ?? 0,
-      end_line: s.endLine ?? s.end_line ?? 0,
+      start_line: surfaceLines(s).startLine,
+      end_line: surfaceLines(s).endLine,
       signature: s.signature || null,
       metadata: s.metadata || {},
     }));
@@ -180,7 +185,15 @@ export function createContractRegistry(store) {
 }
 
 function surfaceKey(surface) {
-  return [surface.path, surface.symbol, surface.kind, surface.startLine ?? surface.start_line ?? 0].join('\0');
+  return [surface.path, surface.symbol, surface.kind, surfaceLines(surface).startLine].join('\0');
+}
+
+// Lines are 1-based. File-level surfaces (e.g. an OpenAPI document) carry no
+// line, and most detectors report only a start line.
+function surfaceLines(surface) {
+  const startLine = surface.startLine ?? surface.start_line ?? 1;
+  const endLine = surface.endLine ?? surface.end_line ?? startLine;
+  return { startLine, endLine: Math.max(endLine, startLine) };
 }
 
 function parseMetadata(metadata) {

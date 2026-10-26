@@ -1,0 +1,12 @@
+{
+  "perSymbol": [
+    { "tool": "oracle.context", "args": { "task": "explain how {{symbol}} works and where it is used" } }
+  ],
+  "perTopSymbol": [
+    { "tool": "oracle.where_would", "args": { "intent": "a new module similar to {{symbol}}" } }
+  ],
+  "fixed": [
+    { "tool": "oracle.conventions_for", "args": { "topic": "errors" } },
+    { "tool": "oracle.conventions_for", "args": { "topic": "testing" } }
+  ]
+}

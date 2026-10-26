@@ -110,7 +110,7 @@ function loadLanguages() {
       for (const ext of entry.extensions) {
         extMap.set(ext, entry.name);
       }
-      console.log(`[parser] loaded ${entry.name}${abiOk ? '' : ' (script extraction only)'}`);
+      if (process.env.ORACLE_DEBUG === 'true') console.error(`[parser] loaded ${entry.name}${abiOk ? '' : ' (script extraction only)'}`);
     } catch (err) {
       console.warn(`[parser] failed to load ${entry.name} (${entry.pkg}): ${err.message}`);
     }

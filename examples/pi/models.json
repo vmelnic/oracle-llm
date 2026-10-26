@@ -1,0 +1,11 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "oracle-local": {
+      "baseUrl": "http://127.0.0.1:8321/v1",
+      "api": "openai-completions",
+      "apiKey": "local",
+      "models": [{ "id": "Qwen3-4B-Instruct-2507-Q4_K_M" }]
+    }
+  }
+}

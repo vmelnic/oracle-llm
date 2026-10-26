@@ -1,3 +1,4 @@
+import fs from 'fs';
 import path from 'path';
 
 export function validate(ctx, { path: filePath, proposed_code }) {
@@ -29,6 +30,8 @@ export function validate(ctx, { path: filePath, proposed_code }) {
 
   if (proposed_code) {
     checkImportConsistency(proposed_code, store, subId, filePath, issues, okChecks);
+    checkModuleSystem(proposed_code, filePath, subproject, issues, okChecks);
+    checkFunctionNaming(proposed_code, store, subId, issues, okChecks);
     checkStructuralIssues(proposed_code, filePath, issues, okChecks);
   }
 
@@ -243,7 +246,7 @@ function checkImportConsistency(proposedCode, store, subId, filePath, issues, ok
   if (sameDir.length === 0) return;
 
   const hasEsm = importLines.some((l) => l.trim().startsWith('import '));
-  const hasCjs = importLines.some((l) => /require\s*\(/.test(l));
+  const hasCjs = /\brequire\s*\(/.test(proposedCode);
 
   if (hasEsm && hasCjs) {
     issues.push({
@@ -256,8 +259,66 @@ function checkImportConsistency(proposedCode, store, subId, filePath, issues, ok
   }
 }
 
+// In an ES-module package (`"type": "module"`), require() throws at runtime in .js/.mjs files.
+function checkModuleSystem(proposedCode, filePath, subproject, issues, okChecks) {
+  if (!filePath || !/\.m?js$/.test(filePath) || !subproject?.root) return;
+  let type;
+  try {
+    type = JSON.parse(fs.readFileSync(path.join(subproject.root, 'package.json'), 'utf-8')).type;
+  } catch {
+    return;
+  }
+  if (type !== 'module' && !filePath.endsWith('.mjs')) return;
+  if (/\brequire\s*\(/.test(proposedCode)) {
+    issues.push({
+      severity: 'error',
+      rule: 'esm-require',
+      fix: 'The package is an ES module ("type": "module"); require() is undefined here. Use import.',
+    });
+  } else {
+    okChecks.push('Uses ES module syntax as the package requires');
+  }
+}
+
+// Function names should follow the casing the codebase's functions use.
+function checkFunctionNaming(proposedCode, store, subId, issues, okChecks) {
+  const proposed = [...proposedCode.matchAll(/\bfunction\s*\*?\s+([A-Za-z_$][\w$]*)|\b(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>/g)]
+    .map((m) => (m[1] || m[2]).replace(/^_+/, ''))
+    .filter(Boolean);
+  if (proposed.length === 0) return;
+
+  const existing = store.findNodes({ subprojectId: subId, kind: 'function' })
+    .map((n) => n.symbol.split('.').pop().replace(/^_+/, ''));
+  const expected = detectCasing(existing);
+  if (!expected) return;
+
+  // Single lowercase words ("slugify") fit camelCase.
+  const offenders = proposed.filter((name) => {
+    const casing = classifyCasing(name);
+    return casing !== null && casing !== expected;
+  });
+  if (offenders.length > 0) {
+    issues.push({
+      severity: 'warning',
+      rule: 'function-naming',
+      fix: `Functions in this codebase use ${expected}; rename ${offenders.join(', ')}.`,
+    });
+  } else {
+    okChecks.push(`Function names follow ${expected}`);
+  }
+}
+
 function checkStructuralIssues(proposedCode, filePath, issues, okChecks) {
   const lines = proposedCode.split('\n');
+
+  // Dynamic code evaluation is a code-injection risk in any codebase.
+  if (/\beval\s*\(|\bnew\s+Function\s*\(/.test(proposedCode)) {
+    issues.push({
+      severity: 'warning',
+      rule: 'no-eval',
+      fix: 'Avoid eval()/new Function(): they execute arbitrary strings as code.',
+    });
+  }
 
   if (lines.length > 500) {
     issues.push({

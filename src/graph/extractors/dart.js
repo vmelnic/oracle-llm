@@ -6,6 +6,66 @@ const FLUTTER_WIDGETS = new Set([
 
 const FLUTTER_STATE_PATTERN = /^_\w+State$/;
 
+// Generic lookups that return an instance of their type argument:
+// Get.find<T>(), GetIt.I<T>(), locator<T>(), context.read<T>(), Provider.of<T>().
+const DI_LOOKUPS = new Set(['find', 'put', 'get', 'read', 'watch', 'of', 'I', 'instance', 'call', 'getIt', 'locator', 'sl', 'inject', 'resolve']);
+// GetX views expose their controller as `controller`.
+const GETX_VIEWS = new Set(['GetView', 'GetWidget', 'GetResponsiveView', 'GetResponsiveWidget']);
+
+function nextBody(parent, index) {
+  const next = parent.namedChild(index + 1);
+  return next?.type === 'function_body' ? next : null;
+}
+
+// Calls `visit(primary, selectors)` for each primary followed by selectors
+// among a node's children.
+function forEachChain(node, visit) {
+  const kids = node.namedChildren;
+  for (let i = 0; i < kids.length; i++) {
+    if (kids[i].type === 'selector' || kids[i + 1]?.type !== 'selector') continue;
+    let j = i + 1;
+    while (j < kids.length && kids[j].type === 'selector') j++;
+    visit(kids[i], kids.slice(i + 1, j));
+    i = j - 1;
+  }
+}
+
+function isInvocation(selector) {
+  return selector.namedChild(0)?.type === 'argument_part';
+}
+
+function selectorName(selector) {
+  const inner = selector.namedChild(0);
+  if (inner?.type !== 'unconditional_assignable_selector' && inner?.type !== 'conditional_assignable_selector') return null;
+  return findFirst(inner, 'identifier')?.text ?? null;
+}
+
+// The single type argument of an invocation: `<Foo>()` -> Foo.
+function typeArgument(selector) {
+  const args = findFirst(selector.namedChild(0), 'type_arguments');
+  const types = args ? collectNamedChildren(args, 'type_identifier') : [];
+  return args && args.namedChildCount === 1 && types.length === 1 ? types[0].text : null;
+}
+
+// Return type written before a function's name (`Future<Foo> load()` -> `Future<Foo>`).
+function declaredReturnType(sig) {
+  const parts = [];
+  for (const child of sig.namedChildren) {
+    if (child.type === 'identifier' || child.type === 'formal_parameter_list') break;
+    if (child.type === 'type_identifier' || child.type === 'type_arguments') parts.push(child.text);
+  }
+  const text = parts.join('');
+  return /^[A-Z]/.test(text) ? text : null;
+}
+
+// Declared class type of a declaration or parameter (`final Repo repo`, `Foo? x`).
+function typeOf(node) {
+  const type = findFirst(node, 'type_identifier')?.text;
+  return type && /^[A-Z]/.test(type) && !BUILTIN_TYPES.has(type) ? type : null;
+}
+
+const BUILTIN_TYPES = new Set(['String', 'List', 'Map', 'Set', 'Iterable', 'Future', 'Stream', 'Object', 'Function', 'DateTime', 'Duration', 'Uri', 'Type', 'Never', 'Null', 'Record', 'Symbol', 'BigInt', 'RegExp', 'Completer', 'FutureOr', 'Rx', 'RxList', 'RxMap', 'RxBool', 'RxInt', 'RxString', 'RxDouble']);
+
 function walk(node, visitor) {
   const result = visitor(node);
   if (result === false) return;
@@ -200,17 +260,17 @@ export function extract(tree, filePath, subprojectId) {
     } else if (topNode.type === 'mixin_declaration') {
       extractMixin(topNode);
     } else if (topNode.type === 'function_signature') {
-      extractTopLevelFunction(topNode);
+      extractTopLevelFunction(topNode, null, nextBody(root, i));
     } else if (topNode.type === 'declaration') {
-      extractDeclaration(topNode, null);
+      extractDeclaration(topNode, null, nextBody(root, i));
     } else if (topNode.type === 'initialized_variable_definition') {
       extractTopLevelVariable(topNode);
     } else if (topNode.type === 'expression_statement') {
       extractExpressionStatement(topNode, null);
-    } else {
+    } else if (topNode.type !== 'function_body') {
       const funcSig = findFirst(topNode, 'function_signature');
       if (funcSig) {
-        extractTopLevelFunction(funcSig, topNode);
+        extractTopLevelFunction(funcSig, topNode, nextBody(root, i));
       }
     }
   }
@@ -310,23 +370,26 @@ export function extract(tree, filePath, subprojectId) {
 
     const body = node.childForFieldName('body');
     if (body) {
-      extractClassBody(body, name, isWidget, superName);
+      extractClassBody(body, name, isWidget, superName, node);
     }
   }
 
-  function extractClassBody(body, className, isWidget, superName) {
+  // A member's body is the `function_body` that follows its signature.
+  function extractClassBody(body, className, isWidget, superName, typeNode) {
+    const classCtx = classTypeContext(typeNode, body, className);
     for (let i = 0; i < body.namedChildCount; i++) {
       const member = body.namedChild(i);
+      const fnBody = nextBody(body, i);
 
       if (member.type === 'declaration') {
-        extractClassMember(member, className, isWidget, superName);
+        extractClassMember(member, className, isWidget, superName, fnBody, classCtx);
       } else if (member.type === 'method_signature') {
-        extractMethodSignature(member, className, isWidget, superName);
+        extractMethodSignature(member, className, isWidget, superName, fnBody, classCtx);
       }
     }
   }
 
-  function extractMethodSignature(sigNode, className, isWidget, superName) {
+  function extractMethodSignature(sigNode, className, isWidget, superName, fnBody, classCtx) {
     const funcSig = findFirst(sigNode, 'function_signature');
     const getterSig = findFirst(sigNode, 'getter_signature');
     const setterSig = findFirst(sigNode, 'setter_signature');
@@ -334,28 +397,35 @@ export function extract(tree, filePath, subprojectId) {
     const factorySig = findFirst(sigNode, 'factory_constructor_signature');
 
     if (funcSig) {
-      processMethodFunction(funcSig, sigNode, className, isWidget, superName, false);
+      processMethodFunction(funcSig, sigNode, className, isWidget, superName, isStatic(sigNode), fnBody, classCtx);
     } else if (getterSig) {
-      processGetterSetter(getterSig, sigNode, className, 'getter');
+      processGetterSetter(getterSig, sigNode, className, 'getter', fnBody, classCtx);
     } else if (setterSig) {
-      processGetterSetter(setterSig, sigNode, className, 'setter');
+      processGetterSetter(setterSig, sigNode, className, 'setter', fnBody, classCtx);
     } else if (ctorSig || factorySig) {
-      const sig = ctorSig || factorySig;
-      const nameNode = sig.childForFieldName('name');
-      const name = nameNode ? nameNode.text : className;
-      const params = getParamSignature(sig);
-      nodes.push(makeNode(subprojectId, filePath, `${className}.${name}`, 'method', {
-        parent_symbol: className,
-        start_line: sigNode.startPosition.row + 1,
-        end_line: sigNode.endPosition.row + 1,
-        signature: `${className}${params || '()'}`,
-        doc: getDocComment(sigNode),
-        metadata: { constructor: true, factory: !!factorySig },
-      }));
+      processConstructor(ctorSig || factorySig, sigNode, className, !!factorySig, fnBody, classCtx);
     }
   }
 
-  function extractClassMember(declNode, className, isWidget, superName) {
+  // Constructors are `Class.Class` (unnamed) or `Class.named`, so a call
+  // `Class.named(...)` resolves like a static method.
+  function processConstructor(sig, declNode, className, factory, fnBody, classCtx) {
+    const identifiers = collectNamedChildren(sig, 'identifier').map(n => n.text);
+    const name = identifiers.length > 1 ? identifiers.slice(1).join('.') : className;
+    const symbol = `${className}.${name}`;
+    const spans = [declNode, fnBody].filter(Boolean);
+    nodes.push(makeNode(subprojectId, filePath, symbol, 'method', {
+      parent_symbol: className,
+      start_line: declNode.startPosition.row + 1,
+      end_line: spans.at(-1).endPosition.row + 1,
+      signature: `${identifiers.join('.') || className}${getParamSignature(sig) || '()'}`,
+      doc: getDocComment(declNode),
+      metadata: { constructor: true, factory },
+    }));
+    extractCalls(spans, { symbol, kind: 'method' }, classCtx, false);
+  }
+
+  function extractClassMember(declNode, className, isWidget, superName, fnBody, classCtx) {
     const funcSig = findFirst(declNode, 'function_signature');
     const getterSig = findFirst(declNode, 'getter_signature');
     const setterSig = findFirst(declNode, 'setter_signature');
@@ -363,39 +433,27 @@ export function extract(tree, filePath, subprojectId) {
     const factorySig = findFirst(declNode, 'factory_constructor_signature');
 
     if (funcSig) {
-      processMethodFunction(funcSig, declNode, className, isWidget, superName, isStatic(declNode));
+      processMethodFunction(funcSig, declNode, className, isWidget, superName, isStatic(declNode), fnBody, classCtx);
     } else if (getterSig) {
-      processGetterSetter(getterSig, declNode, className, 'getter');
+      processGetterSetter(getterSig, declNode, className, 'getter', fnBody, classCtx);
     } else if (setterSig) {
-      processGetterSetter(setterSig, declNode, className, 'setter');
+      processGetterSetter(setterSig, declNode, className, 'setter', fnBody, classCtx);
     } else if (ctorSig || factorySig) {
-      const sig = ctorSig || factorySig;
-      const nameNode = sig.childForFieldName('name');
-      const identifiers = nameNode
-        ? collectNamedChildren(sig, 'identifier')
-        : [];
-      const name = identifiers.map(n => n.text).join('.') || className;
-      const params = getParamSignature(sig);
-      nodes.push(makeNode(subprojectId, filePath, `${className}.${name}`, 'method', {
-        parent_symbol: className,
-        start_line: declNode.startPosition.row + 1,
-        end_line: declNode.endPosition.row + 1,
-        signature: `${name}${params || '()'}`,
-        doc: getDocComment(declNode),
-        metadata: { constructor: true, factory: !!factorySig },
-      }));
+      processConstructor(ctorSig || factorySig, declNode, className, !!factorySig, fnBody, classCtx);
+    } else {
+      // Field initialisers (`final repo = Get.find<Repo>()`) call code too.
+      extractCalls([declNode], { symbol: className, kind: 'class' }, classCtx, false);
     }
-
-    extractConstructorCalls(declNode, className);
   }
 
-  function processMethodFunction(funcSig, parentNode, className, isWidget, superName, staticFlag) {
+  function processMethodFunction(funcSig, parentNode, className, isWidget, superName, staticFlag, fnBody, classCtx) {
     const nameNode = funcSig.childForFieldName('name');
     if (!nameNode) return;
     const name = nameNode.text;
     const params = getParamSignature(funcSig);
     const doc = getDocComment(parentNode);
-    const asyncFlag = isAsync(parentNode);
+    const spans = [parentNode, fnBody].filter(Boolean);
+    const asyncFlag = isAsync(parentNode) || /^\s*async\b/.test(fnBody?.text || '');
 
     const meta = {};
     if (staticFlag) meta.static = true;
@@ -404,42 +462,51 @@ export function extract(tree, filePath, subprojectId) {
     const isBuild = name === 'build';
     const isStateClass = FLUTTER_STATE_PATTERN.test(className);
 
-    if (isBuild && (isWidget || isStateClass)) {
+    const renders = isBuild && (isWidget || isStateClass);
+    if (renders) {
       meta.widget_build = true;
-      extractRenderedWidgets(parentNode, className);
+      extractRenderedWidgets(spans, className);
     }
 
-    nodes.push(makeNode(subprojectId, filePath, `${className}.${name}`, 'method', {
+    const returnType = declaredReturnType(funcSig);
+    if (returnType) meta.return_type = returnType;
+    const symbol = `${className}.${name}`;
+    nodes.push(makeNode(subprojectId, filePath, symbol, 'method', {
       parent_symbol: className,
       start_line: parentNode.startPosition.row + 1,
-      end_line: parentNode.endPosition.row + 1,
+      end_line: spans.at(-1).endPosition.row + 1,
       signature: `${name}${params || '()'}`,
       doc,
       metadata: Object.keys(meta).length ? meta : null,
     }));
 
-    extractConstructorCalls(parentNode, className);
-    extractDbQueries(parentNode, className);
-    extractEventListeners(parentNode, className);
-    extractInjections(parentNode, className);
+    extractConstructorCalls(spans, className);
+    extractDbQueries(spans, className);
+    extractEventListeners(spans, className);
+    extractInjections(spans, className);
+    extractCalls(spans, { symbol, kind: 'method' }, classCtx, renders);
   }
 
-  function processGetterSetter(sig, parentNode, className, accessorKind) {
+  function processGetterSetter(sig, parentNode, className, accessorKind, fnBody, classCtx) {
     const nameNode = sig.childForFieldName('name');
     if (!nameNode) return;
     const name = nameNode.text;
-    nodes.push(makeNode(subprojectId, filePath, `${className}.${name}`, 'method', {
+    const symbol = `${className}.${name}`;
+    const spans = [parentNode, fnBody].filter(Boolean);
+    const returnType = accessorKind === 'getter' ? declaredReturnType(sig) : null;
+    nodes.push(makeNode(subprojectId, filePath, symbol, 'method', {
       parent_symbol: className,
       start_line: parentNode.startPosition.row + 1,
-      end_line: parentNode.endPosition.row + 1,
+      end_line: spans.at(-1).endPosition.row + 1,
       signature: `${accessorKind} ${name}`,
       doc: getDocComment(parentNode),
-      metadata: { [accessorKind]: true },
+      metadata: { [accessorKind]: true, ...(returnType ? { return_type: returnType } : {}) },
     }));
+    extractCalls(spans, { symbol, kind: 'method' }, classCtx, false);
   }
 
-  function extractRenderedWidgets(node, className) {
-    const constructorInvocations = collectAllDeep(node, 'constructor_invocation');
+  function extractRenderedWidgets(spans, className) {
+    const constructorInvocations = spans.flatMap(span => collectAllDeep(span, 'constructor_invocation'));
     const seen = new Set();
     for (const inv of constructorInvocations) {
       const typeId = findFirst(inv, 'type_identifier') || findFirst(inv, 'identifier');
@@ -455,8 +522,8 @@ export function extract(tree, filePath, subprojectId) {
     }
   }
 
-  function extractConstructorCalls(node, contextSymbol) {
-    const invocations = collectAllDeep(node, 'constructor_invocation');
+  function extractConstructorCalls(spans, contextSymbol) {
+    const invocations = spans.flatMap(span => collectAllDeep(span, 'constructor_invocation'));
     const seen = new Set();
     for (const inv of invocations) {
       const typeId = findFirst(inv, 'type_identifier') || findFirst(inv, 'identifier');
@@ -472,8 +539,8 @@ export function extract(tree, filePath, subprojectId) {
     }
   }
 
-  function extractDbQueries(node, contextSymbol) {
-    const text = node.text;
+  function extractDbQueries(spans, contextSymbol) {
+    const text = spans.map(span => span.text).join('\n');
     const dbMethods = ['collection', 'doc', 'get', 'where', 'select', 'insert', 'update', 'delete'];
     const seen = new Set();
     for (const method of dbMethods) {
@@ -488,8 +555,8 @@ export function extract(tree, filePath, subprojectId) {
     }
   }
 
-  function extractEventListeners(node, contextSymbol) {
-    const text = node.text;
+  function extractEventListeners(spans, contextSymbol) {
+    const text = spans.map(span => span.text).join('\n');
     const listenerPatterns = ['addListener(', '.listen(', 'Stream.listen(', 'BlocListener'];
     const seen = new Set();
     for (const pattern of listenerPatterns) {
@@ -503,8 +570,8 @@ export function extract(tree, filePath, subprojectId) {
     }
   }
 
-  function extractInjections(node, contextSymbol) {
-    const text = node.text;
+  function extractInjections(spans, contextSymbol) {
+    const text = spans.map(span => span.text).join('\n');
     const patterns = [
       /GetIt\.I\.get<(\w+)>/g,
       /Provider\.of<(\w+)>/g,
@@ -568,27 +635,36 @@ export function extract(tree, filePath, subprojectId) {
       doc: getDocComment(node),
       metadata: Object.keys(meta).length ? meta : null,
     }));
+
+    const body = findFirst(node, 'class_body');
+    if (body) extractClassBody(body, name, false, null, node);
   }
 
-  function extractTopLevelFunction(funcSigNode, wrapperNode) {
+  function extractTopLevelFunction(funcSigNode, wrapperNode, fnBody) {
     const container = wrapperNode || funcSigNode;
     const nameNode = funcSigNode.childForFieldName('name');
     if (!nameNode) return;
     const name = nameNode.text;
     const params = getParamSignature(funcSigNode);
+    const spans = [container, fnBody].filter(Boolean);
 
+    const fnMeta = {};
+    if (isAsync(container) || /^\s*async\b/.test(fnBody?.text || '')) fnMeta.async = true;
+    const returnType = declaredReturnType(funcSigNode);
+    if (returnType) fnMeta.return_type = returnType;
     nodes.push(makeNode(subprojectId, filePath, name, 'function', {
       start_line: container.startPosition.row + 1,
-      end_line: container.endPosition.row + 1,
+      end_line: spans.at(-1).endPosition.row + 1,
       signature: `${name}${params || '()'}`,
       doc: getDocComment(container),
-      metadata: isAsync(container) ? { async: true } : null,
+      metadata: Object.keys(fnMeta).length ? fnMeta : null,
     }));
 
-    extractConstructorCalls(container, name);
-    extractDbQueries(container, name);
-    extractEventListeners(container, name);
-    extractInjections(container, name);
+    extractConstructorCalls(spans, name);
+    extractDbQueries(spans, name);
+    extractEventListeners(spans, name);
+    extractInjections(spans, name);
+    extractCalls(spans, { symbol: name, kind: 'function' }, null, false);
   }
 
   function extractTopLevelVariable(node) {
@@ -601,7 +677,7 @@ export function extract(tree, filePath, subprojectId) {
     extractRoute(valueText, name, node);
   }
 
-  function extractDeclaration(node, parentSymbol) {
+  function extractDeclaration(node, parentSymbol, fnBody) {
     const varDef = findFirst(node, 'initialized_variable_definition');
     if (varDef) {
       const name = varDef.childForFieldName?.('name')?.text
@@ -616,7 +692,7 @@ export function extract(tree, filePath, subprojectId) {
 
     const funcSig = findFirst(node, 'function_signature');
     if (funcSig && !parentSymbol) {
-      extractTopLevelFunction(funcSig, node);
+      extractTopLevelFunction(funcSig, node, fnBody);
     }
   }
 
@@ -685,6 +761,175 @@ export function extract(tree, filePath, subprojectId) {
         metadata: { provider_type: 'GetX' },
       }));
     }
+  }
+
+  // ── Calls (resolved by the graph builder, see src/graph/calls.js) ──
+  //
+  // Dart chains are flat: a primary (`repo`, `this`, `Foo`) followed by
+  // selectors (`.save`, `(args)`). A name selector followed by arguments is a
+  // method call on everything before it; arguments right after the primary
+  // are a call to a function, a constructor (`Foo()`), or a method on the
+  // implicit `this`.
+
+  function extractCalls(spans, source, classCtx, renders) {
+    const locals = new Map();
+    const ctx = { classCtx, locals };
+    const instantiated = new Set();
+    for (const span of spans) {
+      walk(span, (n) => {
+        recordLocal(n, ctx);
+        forEachChain(n, (primary, selectors) => handleChain(primary, selectors, source, ctx, renders, instantiated));
+      });
+    }
+  }
+
+  function handleChain(primary, selectors, source, ctx, renders, instantiated) {
+    const from = { symbol: source.symbol, kind: source.kind, path: filePath };
+    for (let t = 0; t < selectors.length; t++) {
+      if (!isInvocation(selectors[t])) continue;
+      const nameSelector = t > 0 ? selectors[t - 1] : null;
+      const method = nameSelector ? selectorName(nameSelector) : null;
+      if (method) {
+        const receiverSelectors = selectors.slice(0, t - 1);
+        const typed = chainType(primary, receiverSelectors, ctx);
+        const receiver = primary.text + receiverSelectors.map(sel => sel.text).join('');
+        edges.push(callEdge(from, method, receiver, typed, nameSelector));
+      } else if (t === 0 && primary.type === 'identifier') {
+        const name = primary.text;
+        if (/^[A-Z]/.test(name)) {
+          const seenKey = `${name}:${primary.startPosition.row}`;
+          if (instantiated.has(seenKey)) continue;
+          instantiated.add(seenKey);
+          const line = primary.startPosition.row + 1;
+          edges.push(renders
+            ? makeEdge(subprojectId, { symbol: source.symbol.split('.')[0], kind: 'component', path: filePath }, { symbol: name, kind: 'component' }, 'renders', { line })
+            : makeEdge(subprojectId, from, { symbol: name, kind: 'class' }, 'calls', { type: 'instantiation', line }));
+        } else if (!ctx.locals.has(name)) {
+          edges.push(ctx.classCtx
+            ? callEdge(from, name, 'this', { type: ctx.classCtx.className, self: true }, primary, true)
+            : makeEdge(subprojectId, from, { symbol: name, kind: 'function' }, 'calls', { line: primary.startPosition.row + 1 }));
+        }
+      }
+    }
+  }
+
+  function callEdge(from, method, receiver, typed, lineNode, implicit = false) {
+    return makeEdge(subprojectId, from, { symbol: typed?.type ? `${typed.type}.${method}` : method, kind: 'method' }, 'calls', {
+      call: { ...describeCall(method, receiver, typed, implicit), line: lineNode.startPosition.row + 1 },
+    });
+  }
+
+  // `typed` is { type, self } (known class), { call } (what another call
+  // returns, typed by the builder from its return type) or null.
+  function describeCall(method, receiver, typed, implicit = false) {
+    return {
+      method,
+      receiver: receiver.length > 120 ? `${receiver.slice(0, 117)}...` : receiver,
+      ...(typed?.type ? { receiver_type: typed.type } : {}),
+      ...(typed?.call ? { receiver_call: typed.call } : {}),
+      ...(typed?.self ? { self: true } : {}),
+      // A bare `name()` inside a class may also be a top-level function.
+      ...(implicit ? { implicit: true } : {}),
+    };
+  }
+
+  // Locals and parameters, in source order, so later chains see their types.
+  function recordLocal(n, ctx) {
+    const set = (name, type) => { if (name && !ctx.locals.has(name)) ctx.locals.set(name, type ?? null); };
+    if (n.type === 'formal_parameter') {
+      const ctorParam = findFirst(n, 'constructor_param');
+      if (ctorParam) return;
+      const name = n.childForFieldName('name')?.text ?? collectNamedChildren(n, 'identifier').at(-1)?.text;
+      set(name, typeOf(n));
+    } else if (n.type === 'initialized_variable_definition') {
+      const name = n.childForFieldName('name')?.text;
+      set(name, typeOf(n) ?? valueType(n, name, ctx));
+    }
+  }
+
+  function chainType(primary, selectors, ctx) {
+    let current = primaryType(primary, ctx);
+    for (let t = 0; t < selectors.length; t++) {
+      const sel = selectors[t];
+      if (isInvocation(sel)) {
+        const callee = t > 0 ? selectorName(selectors[t - 1]) : (primary.type === 'identifier' ? primary.text : null);
+        const generic = typeArgument(sel);
+        if (generic && DI_LOOKUPS.has(callee)) current = { type: generic };
+        else if (t <= 1 && current?.isClass) current = { type: current.type }; // Foo(), Foo.named()
+        else if (t > 0 && callee) {
+          // The result of a method call: typed later from its return type.
+          const receiver = primary.text + selectors.slice(0, t - 1).map(x => x.text).join('');
+          current = { call: describeCall(callee, receiver, current) };
+        } else if (t === 0 && callee && !ctx.locals?.has(callee)) {
+          current = ctx.classCtx
+            ? { call: describeCall(callee, 'this', { type: ctx.classCtx.className, self: true }, true) }
+            : { call: { method: callee, receiver: '', function: true } };
+        } else current = null;
+      } else {
+        if (t + 1 < selectors.length && isInvocation(selectors[t + 1])) continue; // a method name
+        const field = current?.self ? ctx.classCtx?.fields.get(selectorName(sel)) : null;
+        current = field ? { type: field } : null;
+      }
+    }
+    return current;
+  }
+
+  function primaryType(primary, ctx) {
+    if (primary.type === 'this') return ctx.classCtx ? { type: ctx.classCtx.className, self: true } : null;
+    if (primary.type !== 'identifier') return null;
+    const name = primary.text;
+    if (ctx.locals?.has(name)) {
+      const type = ctx.locals.get(name);
+      if (!type) return null;
+      return typeof type === 'string' ? { type } : type;
+    }
+    const field = ctx.classCtx?.fields.get(name);
+    if (field) return { type: field };
+    return /^[A-Z]/.test(name) ? { type: name, isClass: true } : null;
+  }
+
+  // Type of an initialiser: the primary/selectors that follow the name.
+  function valueType(defNode, name, ctx) {
+    const kids = defNode.namedChildren;
+    const start = kids.findIndex(k => k.type === 'identifier' && k.text === name);
+    let rest = kids.slice(start + 1);
+    if (rest[0]?.type === 'unary_expression' || rest[0]?.type === 'await_expression') {
+      const inner = rest[0].type === 'unary_expression' ? findFirst(rest[0], 'await_expression') : rest[0];
+      rest = inner ? inner.namedChildren : [];
+    }
+    if (!rest[0] || rest[0].type === 'selector') return null;
+    const selectors = [];
+    for (const k of rest.slice(1)) {
+      if (k.type !== 'selector') break;
+      selectors.push(k);
+    }
+    const typed = selectors.length > 0 ? chainType(rest[0], selectors, ctx) : null;
+    if (typed?.type) return typed.type;
+    return typed?.call ? { call: typed.call } : null;
+  }
+
+  // Fields of a class: declared types, `= Foo()` / `= Get.find<Foo>()`
+  // initialisers, `controller` of GetX views and `widget` of a `State<W>`.
+  function classTypeContext(typeNode, body, className) {
+    const fields = new Map();
+    const classCtx = { className, fields };
+    for (const member of body.namedChildren) {
+      if (member.type !== 'declaration') continue;
+      const declared = typeOf(member);
+      const list = findFirst(member, 'initialized_identifier_list');
+      for (const item of list ? collectNamedChildren(list, 'initialized_identifier') : []) {
+        const name = findFirst(item, 'identifier')?.text;
+        const type = declared ?? valueType(item, name, { classCtx, locals: new Map() });
+        if (name && typeof type === 'string' && !fields.has(name)) fields.set(name, type);
+      }
+    }
+    const superclass = typeNode?.childForFieldName?.('superclass');
+    const base = superclass ? findFirst(superclass, 'type_identifier')?.text : null;
+    const typeArgs = superclass ? findFirst(superclass, 'type_arguments') : null;
+    const argument = typeArgs ? findFirst(typeArgs, 'type_identifier')?.text : null;
+    if (argument && GETX_VIEWS.has(base) && !fields.has('controller')) fields.set('controller', argument);
+    if (argument && base === 'State' && !fields.has('widget')) fields.set('widget', argument);
+    return classCtx;
   }
 
   function buildClassSignature(name, superName, mixins, interfaces, isAbstract) {

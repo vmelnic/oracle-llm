@@ -1,19 +1,19 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { capFiles, globFiles } from '../../utils/glob.js';
 
 export class KafkaTopicDetector {
   async detect(subproject) {
     const surfaces = [];
 
-    const kafkaFiles = await fg(
+    const kafkaFiles = await globFiles(
       [
         '**/kafka/**/*.{yml,yaml,properties,json}',
         '**/kafka*.{yml,yaml,properties,json}',
         '**/topics.{yml,yaml,json}',
         '**/events.{yml,yaml,json}',
       ],
-      { cwd: subproject.root, absolute: true, ignore: ['node_modules/**', 'vendor/**'] }
+      { cwd: subproject.root, absolute: true, ignore: ['**/vendor/**'] }
     );
 
     for (const f of kafkaFiles) {
@@ -51,13 +51,13 @@ export class KafkaTopicDetector {
       }
     }
 
-    const codeFiles = await fg(
+    const codeFiles = await globFiles(
       ['**/*.{php,js,ts,java,py,go}'],
-      { cwd: subproject.root, absolute: true, ignore: ['node_modules/**', 'vendor/**'] }
+      { cwd: subproject.root, absolute: true, ignore: ['**/vendor/**'] }
     );
     const seenTopics = new Set(surfaces.map((s) => s.symbol));
 
-    for (const f of codeFiles.slice(0, 500)) {
+    for (const f of capFiles(codeFiles, 'kafka-topic')) {
       const content = fs.readFileSync(f, 'utf-8');
       const topicPatterns = [
         /['"]([\w.-]+\.(created|updated|deleted|event|command|query))['"]/gi,

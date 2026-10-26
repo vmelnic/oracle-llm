@@ -1,11 +1,22 @@
 import fs from 'fs';
 import path from 'path';
-import { execFileSync, spawn } from 'child_process';
+import { execFile, spawn } from 'child_process';
+import { promisify } from 'node:util';
 import fg from 'fast-glob';
+import { globFiles } from '../utils/glob.js';
 import os from 'node:os';
-import { createParser } from '../parser/index.js';
-import { GraphStore } from '../graph/store.js';
-import { L2Index } from '../retrieval/index.js';
+import { positiveInt } from '../utils/env.js';
+import { possibleCallSites, relatedMethods } from '../graph/usage.js';
+
+const execFileAsyncRaw = promisify(execFile);
+// execFile pipes stdin; close it so a tool that reads stdin exits instead of
+// waiting for input until its timeout.
+function execFileAsync(command, args, options) {
+  const pending = execFileAsyncRaw(command, args, options);
+  pending.child.stdin?.end();
+  return pending;
+}
+const EXEC_MAX_BUFFER = 16 * 1024 * 1024;
 
 /**
  * EmitGate — pre-commit validation pipeline for proposed code changes.
@@ -47,14 +58,14 @@ export class EmitGate {
     }
 
     try {
-      this._createShadowWorkspace(diff);
+      await this._createShadowWorkspace(diff);
       steps.push(await this.runParseCheck(diff));
       steps.push(await this.runTypeCheck(diff));
       steps.push(await this.runValidate(diff));
       steps.push(await this.runImpact(diff));
       steps.push(await this.runTests(diff));
     } finally {
-      this._removeShadowWorkspace();
+      await this._removeShadowWorkspace();
     }
 
     const failed = steps.filter((s) => !s.passed);
@@ -69,25 +80,27 @@ export class EmitGate {
     };
   }
 
-  _createShadowWorkspace(diff) {
+  // Async throughout: copying up to ORACLE_GATE_MAX_SHADOW_BYTES must not block
+  // the event loop (and with it every other MCP session).
+  async _createShadowWorkspace(diff) {
     const root = this.subproject?.root;
     const changes = diff?.files || [];
     if (!root || changes.length === 0 || process.env.ORACLE_GATE_USE_SHADOW === 'false') return;
 
-    const shadow = fs.mkdtempSync(path.join(os.tmpdir(), 'oracle-gate-'));
+    const shadow = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'oracle-gate-'));
     const excluded = new Set(['.git', 'node_modules', 'vendor', '.venv', 'venv', 'target', 'dist', 'build']);
     const maxShadowFiles = positiveInt(process.env.ORACLE_GATE_MAX_SHADOW_FILES, 100_000);
     const maxShadowBytes = positiveInt(process.env.ORACLE_GATE_MAX_SHADOW_BYTES, 1024 * 1024 * 1024);
     let copiedFiles = 0;
     let copiedBytes = 0;
     try {
-      fs.cpSync(root, shadow, {
+      await fs.promises.cp(root, shadow, {
         recursive: true,
         dereference: false,
-        filter(source) {
+        async filter(source) {
           if (source === root) return true;
           if (excluded.has(path.basename(source))) return false;
-          const sourceStat = fs.lstatSync(source);
+          const sourceStat = await fs.promises.lstat(source);
           if (sourceStat.isFile()) {
             copiedFiles++;
             copiedBytes += sourceStat.size;
@@ -102,34 +115,34 @@ export class EmitGate {
         const source = path.join(root, dependencyDir);
         const target = path.join(shadow, dependencyDir);
         if (fs.existsSync(source) && !fs.existsSync(target)) {
-          fs.symlinkSync(source, target, process.platform === 'win32' ? 'junction' : 'dir');
+          await fs.promises.symlink(source, target, process.platform === 'win32' ? 'junction' : 'dir');
         }
       }
 
       for (const change of changes) {
         const target = path.join(shadow, change.path);
         if (change.action === 'delete' || change.deleted === true) {
-          if (fs.existsSync(target)) fs.rmSync(target, { recursive: true, force: true });
+          await fs.promises.rm(target, { recursive: true, force: true });
         } else if (typeof change.proposed_code === 'string') {
-          fs.mkdirSync(path.dirname(target), { recursive: true });
-          fs.writeFileSync(target, change.proposed_code, 'utf-8');
+          await fs.promises.mkdir(path.dirname(target), { recursive: true });
+          await fs.promises.writeFile(target, change.proposed_code, 'utf-8');
         }
       }
       this.shadowRoot = shadow;
       this.executionRoot = shadow;
     } catch (err) {
-      try { fs.rmSync(shadow, { recursive: true, force: true }); } catch {}
-      throw new Error(`Failed to prepare isolated emit-gate workspace: ${err.message}`);
+      try { await fs.promises.rm(shadow, { recursive: true, force: true }); } catch {}
+      throw new Error(`Failed to prepare isolated emit-gate workspace: ${err.message}`, { cause: err });
     }
   }
 
-  _removeShadowWorkspace() {
+  async _removeShadowWorkspace() {
     if (!this.shadowRoot) return;
     const tempRoot = path.resolve(os.tmpdir());
     const candidate = path.resolve(this.shadowRoot);
     const relative = path.relative(tempRoot, candidate);
     if (!relative.startsWith('..') && !path.isAbsolute(relative) && path.basename(candidate).startsWith('oracle-gate-')) {
-      try { fs.rmSync(candidate, { recursive: true, force: true }); } catch {}
+      try { await fs.promises.rm(candidate, { recursive: true, force: true }); } catch {}
     }
     this.shadowRoot = null;
     this.executionRoot = this.subproject?.root || null;
@@ -246,34 +259,36 @@ export class EmitGate {
     const lspConfig = this.subproject?.lsp || this.manifest?.lsp;
 
     if (lspConfig?.cmd) {
-      const diagnostics = await this._runLspTypecheck(diff, lspConfig, root);
+      const { diagnostics, unavailable } = await this._runLspTypecheck(diff, lspConfig, root);
+      // A missing language server is an environment gap, not a code defect.
+      if (unavailable) issues.push({ severity: 'info', message: `Typecheck skipped: ${unavailable}` });
       for (const d of diagnostics) {
         issues.push({
-          severity: 'error',
+          severity: d.severity,
           file: d.file,
           line: d.line,
           message: d.message,
         });
       }
     } else {
-      const autoCmd = this._detectTypecheckCommand(lang);
+      const autoCmd = await this._detectTypecheckCommand(lang);
       if (autoCmd) {
         try {
           if (autoCmd.perFile) {
             for (const file of (diff.files || []).filter(item => item.path?.endsWith(autoCmd.extension) && item.action !== 'delete' && item.deleted !== true)) {
-              execFileSync(autoCmd.command, [...autoCmd.args, path.join(root, file.path)], {
+              await execFileAsync(autoCmd.command, [...autoCmd.args, path.join(root, file.path)], {
                 cwd: root,
                 encoding: 'utf-8',
                 timeout: 60_000,
-                stdio: ['ignore', 'pipe', 'pipe'],
+                maxBuffer: EXEC_MAX_BUFFER,
               });
             }
           } else {
-            execFileSync(autoCmd.command, autoCmd.args, {
+            await execFileAsync(autoCmd.command, autoCmd.args, {
               cwd: root,
               encoding: 'utf-8',
               timeout: 60_000,
-              stdio: ['ignore', 'pipe', 'pipe'],
+              maxBuffer: EXEC_MAX_BUFFER,
             });
           }
         } catch (err) {
@@ -305,16 +320,20 @@ export class EmitGate {
   }
 
   async _runLspTypecheck(diff, lspConfig, root) {
-    if (!root || !lspConfig?.cmd) return [];
+    if (!root || !lspConfig?.cmd) return { diagnostics: [], unavailable: null };
 
     const files = (diff.files || []).filter(f => f.proposed_code);
-    if (files.length === 0) return [];
+    if (files.length === 0) return { diagnostics: [], unavailable: null };
 
     const diagnostics = [];
     let lspProcess = null;
+    let unavailable = null;
 
     try {
-      const cmdParts = lspConfig.cmd.split(' ');
+      // Configs saved before `npx --no` was the default would let npx download
+      // and run a package from the registry; force install-free mode.
+      const cmd = lspConfig.cmd.replace(/^npx\s+(?!--no\b|--no-install\b)/, 'npx --no ');
+      const cmdParts = cmd.split(/\s+/);
       lspProcess = spawn(cmdParts[0], cmdParts.slice(1), {
         cwd: root,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -323,6 +342,17 @@ export class EmitGate {
 
       let msgId = 0;
       const pending = new Map();
+      // A server that can't start (missing binary, npx --no refusing to
+      // install) fails pending requests now instead of after their timeout.
+      const failPending = (reason) => {
+        unavailable = unavailable || reason;
+        for (const { reject } of pending.values()) reject(new Error(reason));
+        pending.clear();
+      };
+      lspProcess.on('error', (err) => failPending(`could not start '${lspConfig.cmd}': ${err.message}`));
+      lspProcess.on('exit', (code) => {
+        if (code) failPending(`'${lspConfig.cmd}' exited with code ${code}`);
+      });
       const notifications = [];
       let buffer = '';
 
@@ -332,7 +362,7 @@ export class EmitGate {
         lspProcess.stdin.write(header + msg);
       };
 
-      const lspTimeout = parseInt(process.env.ORACLE_LSP_TIMEOUT_MS, 10) || 10000;
+      const lspTimeout = positiveInt(process.env.ORACLE_LSP_TIMEOUT_MS, 10_000);
       const request = (method, params, timeoutMs = lspTimeout) => new Promise((resolve, reject) => {
         const id = ++msgId;
         pending.set(id, { resolve, reject });
@@ -403,6 +433,7 @@ export class EmitGate {
         for (const d of (diag.diagnostics || [])) {
           if (d.severity === 1 || d.severity === 2) {
             diagnostics.push({
+              severity: d.severity === 1 ? 'error' : 'warning',
               file: path.relative(root, filePath),
               line: (d.range?.start?.line || 0) + 1,
               message: d.message,
@@ -416,57 +447,57 @@ export class EmitGate {
         notify('exit', {});
       } catch {}
     } catch (err) {
-      diagnostics.push({ file: null, line: null, message: `LSP error: ${err.message}` });
+      if (!unavailable) diagnostics.push({ severity: 'error', file: null, line: null, message: `LSP error: ${err.message}` });
     } finally {
       if (lspProcess) {
         try { lspProcess.kill(); } catch {}
       }
     }
 
-    return diagnostics;
+    return { diagnostics, unavailable };
   }
 
-  _detectTypecheckCommand(lang) {
+  async _detectTypecheckCommand(lang) {
     const root = this.executionRoot;
     if (!root) return null;
 
     if (lang === 'typescript' || lang === 'javascript') {
       if (fs.existsSync(path.join(root, 'tsconfig.json'))) {
         const tsc = localBinary(root, 'tsc');
-        if (tsc && commandWorks(tsc, ['--version'], root)) return { command: tsc, args: ['--noEmit'] };
+        if (tsc && await commandWorks(tsc, ['--version'], root)) return { command: tsc, args: ['--noEmit'] };
       }
     }
 
     if (lang === 'php') {
-      if (commandWorks('php', ['-v'], root)) {
+      if (await commandWorks('php', ['-v'], root)) {
         return { command: 'php', args: ['-l'], perFile: true, extension: '.php' };
       }
     }
 
     if (lang === 'dart') {
-      if (commandWorks('dart', ['analyze', '--help'], root)) return { command: 'dart', args: ['analyze'] };
+      if (await commandWorks('dart', ['analyze', '--help'], root)) return { command: 'dart', args: ['analyze'] };
     }
 
     if (lang === 'go') {
-      if (commandWorks('go', ['version'], root)) return { command: 'go', args: ['vet', './...'] };
+      if (await commandWorks('go', ['version'], root)) return { command: 'go', args: ['vet', './...'] };
     }
 
     if (lang === 'rust') {
-      if (commandWorks('cargo', ['--version'], root)) return { command: 'cargo', args: ['check'] };
+      if (await commandWorks('cargo', ['--version'], root)) return { command: 'cargo', args: ['check'] };
     }
 
     if (lang === 'java') {
       if (fs.existsSync(path.join(root, 'pom.xml'))) {
-        if (commandWorks('mvn', ['--version'], root)) return { command: 'mvn', args: ['compile', '-q'] };
+        if (await commandWorks('mvn', ['--version'], root)) return { command: 'mvn', args: ['compile', '-q'] };
       }
       if (fs.existsSync(path.join(root, 'build.gradle'))) {
-        if (commandWorks('gradle', ['--version'], root)) return { command: 'gradle', args: ['compileJava', '-q'] };
+        if (await commandWorks('gradle', ['--version'], root)) return { command: 'gradle', args: ['compileJava', '-q'] };
       }
     }
 
     if (lang === 'python') {
-      if (commandWorks('mypy', ['--version'], root)) return { command: 'mypy', args: ['--ignore-missing-imports', '.'] };
-      if (commandWorks('pyright', ['--version'], root)) return { command: 'pyright', args: [] };
+      if (await commandWorks('mypy', ['--version'], root)) return { command: 'mypy', args: ['--ignore-missing-imports', '.'] };
+      if (await commandWorks('pyright', ['--version'], root)) return { command: 'pyright', args: [] };
     }
 
     return null;
@@ -518,42 +549,37 @@ export class EmitGate {
     };
   }
 
+  // Breaking = an exported symbol that other files use is removed or changes
+  // signature. Decided structurally from the proposed code (same extractor as
+  // ingest), not from how many nodes a file touches.
   async runImpact(diff) {
     const start = Date.now();
-    const { impact } = await import('../mcp/tools/impact.js');
     const issues = [];
+    const subprojectId = this.subproject?.id;
+    const root = this.executionRoot || this.subproject?.root;
 
     for (const change of diff.files || []) {
-      const desc = change.change_description || `modify ${change.path}`;
-      const ctx = {
-        store: this.store,
-        subproject: this.subproject,
-        manifest: this.manifest,
-      };
-
+      if (!change.path) continue;
       try {
-        const result = impact(ctx, { change: desc });
-        if (result.answer.breaking) {
+        const breaks = await this._breakingChanges(change, subprojectId, root);
+        if (breaks.length > 0) {
           issues.push({
             severity: 'error',
             file: change.path,
-            message: `Breaking change detected: ${result.answer.recommendation}`,
-            affected_routes: result.answer.affected_routes,
-            affected_components: result.answer.affected_components,
-          });
-        } else if (result.answer.migration_needed) {
-          issues.push({
-            severity: 'warning',
-            file: change.path,
-            message: `Migration recommended: ${result.answer.recommendation}`,
+            message: `Breaking change: ${breaks.map(b => `${b.symbol} ${b.reason}`).join('; ')}`,
+            symbols: breaks,
           });
         }
+        if (change.change_description) {
+          // Free-text intent can still reveal schema work the code diff doesn't show.
+          const { impact } = await import('../mcp/tools/impact.js');
+          const result = impact({ store: this.store, subproject: this.subproject, manifest: this.manifest }, { change: change.change_description });
+          if (result.answer.migration_needed) {
+            issues.push({ severity: 'warning', file: change.path, message: `Migration recommended: ${result.answer.recommendation}` });
+          }
+        }
       } catch (err) {
-        issues.push({
-          severity: 'warning',
-          file: change.path,
-          message: `Impact analysis failed: ${err.message}`,
-        });
+        issues.push({ severity: 'warning', file: change.path, message: `Impact analysis failed: ${err.message}` });
       }
     }
 
@@ -563,6 +589,61 @@ export class EmitGate {
       issues,
       durationMs: Date.now() - start,
     };
+  }
+
+  async _breakingChanges(change, subprojectId, root) {
+    if (!this.store) return [];
+    // Anything used from another file counts, exported or not: class methods
+    // are not "exported" in JS/TS, yet callers break when they change.
+    // Callers through the interface/parent declaration count too.
+    const usersOf = (node) => {
+      const direct = this.store.getConsumers(node.id);
+      const viaParent = relatedMethods(this.store, subprojectId, node).overrides.flatMap(decl => this.store.getConsumers(decl.id));
+      return [...direct, ...viaParent].filter(c => c.path !== change.path);
+    };
+    const used = this.store.getNodesByFile(subprojectId, change.path)
+      .map(node => ({ node, consumers: usersOf(node) }))
+      .filter(entry => entry.consumers.length > 0 || entry.node.exported);
+    if (used.length === 0) return [];
+
+    const describe = (node, consumers, reason) => {
+      const possible = possibleCallSites(this.store, subprojectId, this.subproject?.root, node).sites;
+      return {
+        symbol: node.symbol,
+        kind: node.kind,
+        reason,
+        consumers: consumers.length,
+        consumer_files: [...new Set(consumers.map(c => c.path))].slice(0, 10),
+        ...(possible.length > 0 ? { possible_call_site_files: possible.map(p => p.path).slice(0, 10) } : {}),
+      };
+    };
+
+    if (change.action === 'delete' || change.deleted === true) {
+      return used.filter(({ consumers }) => consumers.length > 0).map(({ node, consumers }) => describe(node, consumers, 'removed (file deleted)'));
+    }
+    if (typeof change.proposed_code !== 'string') return [];
+
+    const { extractFromSource } = await import('../graph/builder.js');
+    let proposed;
+    try {
+      proposed = await extractFromSource(change.proposed_code, path.join(root, change.path), change.path, subprojectId, this.parser);
+    } catch {
+      return []; // unparseable: the parse step reports it
+    }
+    if (!proposed) return [];
+
+    const normalize = (sig) => String(sig || '').replace(/\s+/g, ' ').trim();
+    const breaks = [];
+    for (const { node, consumers } of used) {
+      if (consumers.length === 0 && possibleCallSites(this.store, subprojectId, this.subproject?.root, node).sites.length === 0) continue;
+      const match = proposed.nodes.find(n => n.symbol === node.symbol && n.kind === node.kind);
+      if (!match || !match.exported) {
+        breaks.push(describe(node, consumers, match ? 'no longer exported' : 'removed'));
+      } else if (normalize(match.signature) !== normalize(node.signature)) {
+        breaks.push(describe(node, consumers, `signature changed: ${normalize(node.signature)} -> ${normalize(match.signature)}`));
+      }
+    }
+    return breaks;
   }
 
   async runTests(diff) {
@@ -581,7 +662,7 @@ export class EmitGate {
     }
 
     const changedPaths = (diff.files || []).map(f => f.path).filter(Boolean);
-    const affectedTestFiles = this._findAffectedTests(changedPaths);
+    const affectedTestFiles = await this._findAffectedTests(changedPaths);
 
     if (affectedTestFiles.length === 0) {
       return {
@@ -592,7 +673,7 @@ export class EmitGate {
       };
     }
 
-    const testCmd = this._detectTestCommand(testFrameworks);
+    const testCmd = await this._detectTestCommand(testFrameworks);
     if (!testCmd) {
       return {
         name: 'affected-tests',
@@ -620,21 +701,20 @@ export class EmitGate {
         testArgs = [...testCmd.args, ...testFileArgs];
       }
 
-      execFileSync(testCmd.command, testArgs, {
+      await execFileAsync(testCmd.command, testArgs, {
         cwd: root,
         encoding: 'utf-8',
-        timeout: 120000,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        timeout: 120_000,
+        maxBuffer: EXEC_MAX_BUFFER,
       });
       issues.push({
         severity: 'info',
         message: `${affectedTestFiles.length} affected test(s) passed.`,
       });
     } catch (err) {
-      const stderr = err.stderr || err.stdout || '';
       issues.push({
         severity: 'error',
-        message: `Test failure: ${stderr.trim().slice(0, 500)}`,
+        message: `Test failure: ${summarizeTestFailure(err)}`,
         files: affectedTestFiles,
       });
     }
@@ -647,7 +727,7 @@ export class EmitGate {
     };
   }
 
-  _findAffectedTests(changedPaths) {
+  async _findAffectedTests(changedPaths) {
     const root = this.executionRoot;
     if (!root) return [];
 
@@ -669,8 +749,9 @@ export class EmitGate {
     }
 
     for (const changed of changedPaths) {
-      const base = path.basename(changed, path.extname(changed));
-      const dir = path.dirname(changed);
+      // Escaped: file names may contain glob syntax ([id].js, (group)/page.tsx).
+      const base = fg.escapePath(path.basename(changed, path.extname(changed)));
+      const dir = fg.escapePath(path.dirname(changed));
 
       const patterns = [
         `${dir}/${base}.test.*`,
@@ -683,18 +764,15 @@ export class EmitGate {
         `spec/**/${base}_spec.*`,
       ];
 
-      for (const pattern of patterns) {
-        try {
-          const matches = fg.sync(pattern, { cwd: root, absolute: false });
-          for (const m of matches) testFiles.add(m);
-        } catch {}
-      }
+      try {
+        for (const m of await globFiles(patterns, { cwd: root, absolute: false })) testFiles.add(m);
+      } catch {}
     }
 
     return [...testFiles];
   }
 
-  _detectTestCommand(testFrameworks) {
+  async _detectTestCommand(testFrameworks) {
     const root = this.executionRoot;
     if (!root) return null;
 
@@ -705,56 +783,61 @@ export class EmitGate {
         if (fs.existsSync(path.join(root, 'vendor/bin/phpunit'))) {
           return { command: path.join(root, 'vendor/bin/phpunit'), args: [] };
         }
-        if (commandWorks('phpunit', ['--version'], root)) return { command: 'phpunit', args: [] };
+        if (await commandWorks('phpunit', ['--version'], root)) return { command: 'phpunit', args: [] };
       }
 
       if (lower === 'jest') {
         const binary = localBinary(root, 'jest');
-        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: ['--no-coverage'] };
+        if (binary && await commandWorks(binary, ['--version'], root)) return { command: binary, args: ['--no-coverage'] };
       }
 
       if (lower === 'vitest') {
         const binary = localBinary(root, 'vitest');
-        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: [] };
+        if (binary && await commandWorks(binary, ['--version'], root)) return { command: binary, args: [] };
+      }
+
+      if (lower === 'node-test') {
+        // Same Node binary as the oracle: always available, no probe needed.
+        return { command: process.execPath, args: ['--test'] };
       }
 
       if (lower === 'mocha') {
         const binary = localBinary(root, 'mocha');
-        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: [] };
+        if (binary && await commandWorks(binary, ['--version'], root)) return { command: binary, args: [] };
       }
 
       if (lower === 'pytest') {
-        if (commandWorks('pytest', ['--version'], root)) return { command: 'pytest', args: ['-x'] };
+        if (await commandWorks('pytest', ['--version'], root)) return { command: 'pytest', args: ['-x'] };
       }
 
       if (lower === 'playwright') {
         const binary = localBinary(root, 'playwright');
-        if (binary && commandWorks(binary, ['--version'], root)) return { command: binary, args: ['test'] };
+        if (binary && await commandWorks(binary, ['--version'], root)) return { command: binary, args: ['test'] };
       }
 
       if (lower === 'flutter_test' || lower === 'dart') {
-        if (commandWorks('flutter', ['test', '--help'], root)) return { command: 'flutter', args: ['test'] };
+        if (await commandWorks('flutter', ['test', '--help'], root)) return { command: 'flutter', args: ['test'] };
       }
 
       if (lower === 'go' || lower === 'go_test') {
-        if (commandWorks('go', ['version'], root)) return { command: 'go', args: ['test'] };
+        if (await commandWorks('go', ['version'], root)) return { command: 'go', args: ['test'] };
       }
 
       if (lower === 'cargo' || lower === 'rust') {
-        if (commandWorks('cargo', ['--version'], root)) return { command: 'cargo', args: ['test'] };
+        if (await commandWorks('cargo', ['--version'], root)) return { command: 'cargo', args: ['test'] };
       }
 
       if (lower === 'unittest' || lower === 'python') {
-        if (commandWorks('python', ['-m', 'pytest', '--version'], root)) return { command: 'python', args: ['-m', 'pytest', '-x'] };
-        if (commandWorks('python', ['--version'], root)) return { command: 'python', args: ['-m', 'unittest'] };
+        if (await commandWorks('python', ['-m', 'pytest', '--version'], root)) return { command: 'python', args: ['-m', 'pytest', '-x'] };
+        if (await commandWorks('python', ['--version'], root)) return { command: 'python', args: ['-m', 'unittest'] };
       }
 
       if (lower === 'junit' || lower === 'maven') {
-        if (commandWorks('mvn', ['--version'], root)) return { command: 'mvn', args: ['test', '-q'] };
+        if (await commandWorks('mvn', ['--version'], root)) return { command: 'mvn', args: ['test', '-q'] };
       }
 
       if (lower === 'gradle') {
-        if (commandWorks('gradle', ['--version'], root)) return { command: 'gradle', args: ['test'] };
+        if (await commandWorks('gradle', ['--version'], root)) return { command: 'gradle', args: ['test'] };
       }
     }
 
@@ -785,7 +868,7 @@ function parseTypecheckOutput(output) {
     /^(.+?):(\d+):(\d+)?\s*-\s*error\s+(.+)$/gm,
     /^(.+?):(\d+):(\d+)?:\s*error:\s*(.+)$/gm,
     /^(ERROR|error)\s+\[(.+?)\]\s+(.+?):(\d+):(\d+)/gm,
-    /^  (.+?):(\d+):(\d+):\s*error:\s*(.+)$/gm,
+    /^ {2}(.+?):(\d+):(\d+):\s*error:\s*(.+)$/gm,
   ];
 
   for (const pat of patterns) {
@@ -819,18 +902,13 @@ function localBinary(root, name) {
   return fs.existsSync(candidate) ? candidate : null;
 }
 
-function commandWorks(command, args, cwd) {
+async function commandWorks(command, args, cwd) {
   try {
-    execFileSync(command, args, { cwd, stdio: 'pipe', timeout: 5000 });
+    await execFileAsync(command, args, { cwd, timeout: 5000, maxBuffer: EXEC_MAX_BUFFER });
     return true;
   } catch {
     return false;
   }
-}
-
-function positiveInt(value, fallback) {
-  const parsed = Number.parseInt(value || '', 10);
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function hasSymlinkComponent(root, relativePath) {
@@ -855,4 +933,36 @@ function isTestPath(filePath) {
     || /_test\.(dart|go|py)$/.test(lower)
     || /Test\.php$/.test(filePath)
     || lower.includes('tests/') || lower.includes('test/');
+}
+
+// The useful part of a failed test run: failing test names and their error
+// lines (TAP `not ok` blocks), else the tail of the output, which is where
+// runners print the failure summary.
+function summarizeTestFailure(err) {
+  if (err.killed || err.signal) return `test run terminated (${err.signal || 'timeout'})`;
+  const output = `${err.stdout || ''}\n${err.stderr || ''}`;
+  const lines = output.split('\n');
+  const picked = [];
+  for (let i = 0; i < lines.length && picked.length < 20; i++) {
+    if (!/^\s*not ok\b/.test(lines[i])) continue;
+    picked.push(lines[i].trim());
+    for (let j = i + 1; j < Math.min(lines.length, i + 25); j++) {
+      if (/^\s*(not )?ok\b/.test(lines[j])) break;
+      if (!/^\s*(error|message|failureType|expected|actual|code):/.test(lines[j])) continue;
+      picked.push(`  ${lines[j].trim()}`);
+      // YAML block scalar (`error: |-`): the message is on the following lines.
+      if (/:\s*\|-?\s*$/.test(lines[j])) {
+        for (let k = j + 1; k < Math.min(lines.length, j + 4) && !/^\s*\w+:/.test(lines[k]); k++) {
+          if (lines[k].trim()) picked.push(`    ${lines[k].trim()}`);
+        }
+      }
+    }
+  }
+  // A file that fails to load (bad import, syntax error) is reported only as
+  // "test failed"; the cause is in diagnostic lines like "# SyntaxError: ...".
+  const causes = [...new Set(lines
+    .map(line => line.replace(/^\s*#\s*/, '').trim())
+    .filter(line => /^(\w+Error|Error)\b.*:/.test(line)))].slice(0, 5);
+  const text = picked.length > 0 ? [...causes, ...picked].join('\n') : lines.filter(Boolean).slice(-15).join('\n');
+  return text.slice(0, 2000);
 }

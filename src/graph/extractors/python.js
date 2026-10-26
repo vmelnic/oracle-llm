@@ -1,4 +1,3 @@
-const HTTP_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'options', 'head']);
 const ROUTE_DECORATORS = new Set([
   'route', 'get', 'post', 'put', 'patch', 'delete', 'options', 'head',
 ]);

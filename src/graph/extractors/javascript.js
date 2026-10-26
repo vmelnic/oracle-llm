@@ -17,7 +17,7 @@ const LIFECYCLE_HOOKS = new Set([
 export function extract(tree, filePath, subprojectId) {
   const nodes = [];
   const edges = [];
-  const ctx = { filePath, subprojectId, nodes, edges };
+  const ctx = { filePath, subprojectId, nodes, edges, importedNames: collectImportedNames(tree.rootNode) };
 
   detectMigrationAndTables(filePath, tree, ctx);
 
@@ -85,6 +85,7 @@ function handleFunctionDeclaration(node, scope, ctx, exported = false) {
   const isHook = kind === 'hook';
   const isComponent = kind === 'component';
 
+  const returnType = jsdocReturnType(doc) || constructedReturnType(node);
   ctx.nodes.push(makeNode(ctx, {
     symbol: scopedSymbol(scope, name),
     kind: isHook ? 'hook' : isComponent ? 'component' : 'function',
@@ -94,6 +95,7 @@ function handleFunctionDeclaration(node, scope, ctx, exported = false) {
     exported,
     signature,
     doc,
+    metadata: returnType ? { return_type: returnType } : undefined,
   }));
 
   if (exported) {
@@ -184,6 +186,8 @@ function handleMethodDefinition(node, className, ctx) {
   if (isStatic) metadata.static = true;
   if (isAsync) metadata.async = true;
   if (kind) metadata.method_kind = kind;
+  const returnType = jsdocReturnType(doc) || constructedReturnType(node);
+  if (returnType) metadata.return_type = returnType;
 
   const symbol = `${className}.${name}`;
   const signature = buildMethodSignature(name, params, { isStatic, isAsync, kind });
@@ -349,17 +353,115 @@ function handleVariableDeclaration(node, scope, ctx, exported) {
     if (isFunctionNode(value)) {
       handleArrowOrFunctionExpression(name, value, scope, ctx, exported, node);
     } else if (value.type === 'call_expression') {
-      handleVariableCallExpression(name, value, scope, ctx, exported, node);
-    } else if (exported) {
-      ctx.edges.push(makeEdge(ctx, {
-        source_symbol: scopedSymbol(scope, name),
-        source_kind: 'function',
-        target_symbol: ctx.filePath,
-        target_kind: 'file',
-        kind: 'provides',
-      }));
+      if (!handleVariableCallExpression(name, value, scope, ctx, exported, node) && !scope) {
+        handleModuleVariable(name, value, ctx, exported, node, walkFunctionBody);
+      }
+    } else if (!scope) {
+      handleModuleVariable(name, value, ctx, exported, node, walkFunctionBody);
     }
   }
+}
+
+const LITERAL_TYPES = new Set(['string', 'number', 'true', 'false', 'null', 'undefined', 'regex', 'template_string']);
+
+/**
+ * A module-level constant that is not a function (columns, schemas, route
+ * tables, config objects): a `variable` node, so the calls, JSX and
+ * references inside it have a source. Unexported literals are skipped.
+ */
+export function handleModuleVariable(name, value, ctx, exported, declNode, walkBody, typeAnno = null) {
+  const literal = LITERAL_TYPES.has(value.type) && !(value.type === 'template_string' && value.namedChildCount > 0);
+  if (literal && !exported) return;
+  ctx.nodes.push(makeNode(ctx, {
+    symbol: name,
+    kind: 'variable',
+    parent_symbol: null,
+    start_line: declNode.startPosition.row + 1,
+    end_line: declNode.endPosition.row + 1,
+    exported: !!exported,
+    signature: `const ${name}${typeAnno ? typeAnno.text : ''}`,
+    doc: extractLeadingDoc(declNode),
+  }));
+  if (exported) {
+    ctx.edges.push(makeEdge(ctx, {
+      source_symbol: name,
+      source_kind: 'variable',
+      target_symbol: ctx.filePath,
+      target_kind: 'file',
+      kind: 'provides',
+    }));
+  }
+  if (!literal) walkBody(value, name, ctx);
+}
+
+/**
+ * Names a value reference can point at: bindings of the file's import
+ * statements and its own top-level declarations.
+ */
+export function collectImportedNames(root) {
+  const names = new Set();
+  const declare = (decl) => {
+    if (!decl) return;
+    if (decl.type === 'lexical_declaration' || decl.type === 'variable_declaration') {
+      for (const d of decl.namedChildren) {
+        if (d.type === 'variable_declarator' && d.childForFieldName('name')?.type === 'identifier') names.add(d.childForFieldName('name').text);
+      }
+    } else if (/^(function|generator_function|class|abstract_class)_declaration$/.test(decl.type)) {
+      const name = decl.childForFieldName('name')?.text;
+      if (name) names.add(name);
+    }
+  };
+  for (let i = 0; i < root.namedChildCount; i++) {
+    const stmt = root.namedChild(i);
+    if (stmt.type === 'export_statement') declare(stmt.childForFieldName('declaration'));
+    else declare(stmt);
+    if (stmt.type !== 'import_statement') continue;
+    walkTree(stmt, (n) => {
+      if (n.type !== 'identifier') return;
+      const parentType = n.parent?.type;
+      if (parentType === 'import_specifier') {
+        const alias = n.parent.childForFieldName('alias');
+        if (!alias || sameNode(alias, n)) names.add(n.text);
+      } else if (parentType === 'import_clause' || parentType === 'namespace_import') {
+        names.add(n.text);
+      }
+    });
+  }
+  return names;
+}
+
+/**
+ * An imported or top-level name used as a value (`component: Page`,
+ * `onSave={save}`, `{ handlers: { context } }`, `<Shell sections={sections}/>`)
+ * is a dependency even though it is not called here: a `references` edge,
+ * once per source symbol.
+ */
+export function extractValueReference(node, scope, ctx) {
+  if (!scope || scope === node.text || !ctx.importedNames?.has(node.text)) return;
+  const parent = node.parent;
+  if (!parent) return;
+  if (parent.type === 'call_expression' && sameNode(parent.childForFieldName('function'), node)) return;
+  if (parent.type === 'member_expression' && sameNode(parent.childForFieldName('property'), node)) return;
+  if ((parent.type === 'jsx_opening_element' || parent.type === 'jsx_closing_element' || parent.type === 'jsx_self_closing_element') &&
+    sameNode(parent.childForFieldName('name'), node)) return;
+  if (/^(import|export)_/.test(parent.type) || parent.type === 'namespace_import') return;
+  if (node.type === 'identifier' && localBinding(node, { includeModule: false })) return; // shadowed
+  ctx.referenced ||= new Set();
+  const key = `${scope}\x00${node.text}\x00${node.startPosition.row}`;
+  if (ctx.referenced.has(key)) return;
+  ctx.referenced.add(key);
+  ctx.edges.push(makeEdge(ctx, {
+    source_symbol: scope,
+    source_kind: 'function',
+    target_symbol: node.text,
+    target_kind: 'function',
+    kind: 'references',
+    metadata: { line: node.startPosition.row + 1 },
+  }));
+}
+
+function sameNode(a, b) {
+  return !!a && !!b && a.startIndex === b.startIndex && a.endIndex === b.endIndex && a.type === b.type;
 }
 
 function handleArrowOrFunctionExpression(name, fnNode, scope, ctx, exported, declNode) {
@@ -368,6 +470,7 @@ function handleArrowOrFunctionExpression(name, fnNode, scope, ctx, exported, dec
   const doc = extractLeadingDoc(declNode);
   const kind = classifyFunction(name, fnNode, ctx.filePath);
 
+  const returnType = jsdocReturnType(doc) || constructedReturnType(fnNode);
   ctx.nodes.push(makeNode(ctx, {
     symbol: scopedSymbol(scope, name),
     kind: kind === 'hook' ? 'hook' : kind === 'component' ? 'component' : 'function',
@@ -377,6 +480,7 @@ function handleArrowOrFunctionExpression(name, fnNode, scope, ctx, exported, dec
     exported: !!exported,
     signature,
     doc,
+    metadata: returnType ? { return_type: returnType } : undefined,
   }));
 
   if (exported) {
@@ -395,9 +499,10 @@ function handleArrowOrFunctionExpression(name, fnNode, scope, ctx, exported, dec
   }
 }
 
+/** Returns true when the declaration was recognised (function, component, store, require). */
 function handleVariableCallExpression(name, callNode, scope, ctx, exported, declNode) {
   const callee = callNode.childForFieldName('function');
-  if (!callee) return;
+  if (!callee) return false;
 
   const calleeName = callee.text;
 
@@ -426,7 +531,7 @@ function handleVariableCallExpression(name, callNode, scope, ctx, exported, decl
         }
       }
     }
-    return;
+    return true;
   }
 
   if (calleeName === 'defineComponent') {
@@ -450,7 +555,7 @@ function handleVariableCallExpression(name, callNode, scope, ctx, exported, decl
         kind: 'provides',
       }));
     }
-    return;
+    return true;
   }
 
   // Pinia / Vuex store detection
@@ -475,7 +580,7 @@ function handleVariableCallExpression(name, callNode, scope, ctx, exported, decl
         kind: 'provides',
       }));
     }
-    return;
+    return true;
   }
 
   const args = callNode.childForFieldName('arguments');
@@ -484,10 +589,11 @@ function handleVariableCallExpression(name, callNode, scope, ctx, exported, decl
       const arg = args.child(i);
       if (isFunctionNode(arg)) {
         handleArrowOrFunctionExpression(name, arg, scope, ctx, exported, declNode);
-        return;
+        return true;
       }
     }
   }
+  return false;
 }
 
 function handleExpressionStatement(node, scope, ctx) {
@@ -614,6 +720,8 @@ function handleCallExpression(node, scope, ctx) {
   const args = node.childForFieldName('arguments');
   const calleeText = callee.text;
 
+  if (!scope && handleTestBlock(node, calleeText, args, ctx)) return;
+
   if (callee.type === 'member_expression') {
     handleMemberCallExpression(callee, args, scope, ctx, node);
     return;
@@ -668,8 +776,34 @@ function handleCallExpression(node, scope, ctx) {
       target_symbol: calleeText,
       target_kind: 'function',
       kind: 'calls',
+      metadata: { line: node.startPosition.row + 1 },
     }));
   }
+}
+
+const TEST_BLOCKS = /^(describe|context|suite|it|test|specify)(\.(only|skip|each|concurrent|todo)(\(.*\))?)?$/s;
+
+// A top-level `describe('x', () => ...)` / `test(...)` is a `test` node, so
+// the code a test exercises has the test among its consumers.
+function handleTestBlock(callNode, calleeText, args, ctx) {
+  const base = calleeText.replace(/\(.*$/s, '');
+  if (!TEST_BLOCKS.test(calleeText) && !TEST_BLOCKS.test(base)) return false;
+  const argList = args?.namedChildren || [];
+  const title = argList[0];
+  const fn = argList.find(isFunctionNode);
+  if (!fn || !title || !/^(string|template_string)$/.test(title.type)) return false;
+  const symbol = `${base.split('.')[0]} ${cleanStringLiteral(title.text)}`;
+  ctx.nodes.push(makeNode(ctx, {
+    symbol,
+    kind: 'test',
+    parent_symbol: null,
+    start_line: callNode.startPosition.row + 1,
+    end_line: callNode.endPosition.row + 1,
+    exported: false,
+    signature: `${base}(${title.text}, ...)`,
+  }));
+  walkFunctionBody(fn.childForFieldName('body') || fn, symbol, ctx);
+  return true;
 }
 
 function handleMemberCallExpression(callee, args, scope, ctx, callNode) {
@@ -777,14 +911,307 @@ function handleMemberCallExpression(callee, args, scope, ctx, callNode) {
   }
 
   if (scope) {
-    ctx.edges.push(makeEdge(ctx, {
-      source_symbol: scope,
-      source_kind: 'function',
-      target_symbol: `${objText}.${propText}`,
-      target_kind: 'function',
-      kind: 'calls',
-    }));
+    const edge = memberCallEdge(object, property, scope, ctx);
+    if (edge) ctx.edges.push(edge);
   }
+}
+
+// ── Method calls (resolved by the graph builder, see src/graph/calls.js) ──
+
+// Receivers that are platform globals: their methods are never in the graph.
+const GLOBAL_OBJECTS = new Set([
+  'console', 'JSON', 'Math', 'Object', 'Array', 'Number', 'String', 'Boolean', 'Promise',
+  'Reflect', 'Date', 'Symbol', 'Intl', 'Error', 'RegExp', 'Map', 'Set', 'WeakMap', 'process',
+  'Buffer', 'window', 'document', 'globalThis', 'navigator', 'localStorage', 'sessionStorage',
+  'URL', 'URLSearchParams', 'crypto', 'performance', 'module', 'exports', 'require',
+]);
+const FUNCTION_TYPES = new Set([
+  'function_declaration', 'function_expression', 'function', 'generator_function_declaration',
+  'generator_function', 'arrow_function', 'method_definition',
+]);
+const CLASS_TYPES = new Set(['class_declaration', 'class', 'abstract_class_declaration']);
+
+function memberCallEdge(object, property, scope, ctx) {
+  if (object.type === 'identifier' && GLOBAL_OBJECTS.has(object.text)) return null;
+  if (object.type === 'super') return null;
+  const method = property.text;
+  const typed = receiverType(object, ctx);
+  return makeEdge(ctx, {
+    source_symbol: scope,
+    source_kind: 'function',
+    target_symbol: typed?.type ? `${typed.type}.${method}` : method,
+    target_kind: 'method',
+    kind: 'calls',
+    metadata: { call: { ...describeCall(method, object.text, typed), line: property.startPosition.row + 1 } },
+  });
+}
+
+// `typed` is { type, self } (known class), { call } (what another call
+// returns, typed by the builder from its return type) or null.
+function describeCall(method, receiverText, typed) {
+  return {
+    method,
+    receiver: receiverText.length > 120 ? `${receiverText.slice(0, 117)}...` : receiverText,
+    ...(typed?.type ? { receiver_type: typed.type } : {}),
+    ...(typed?.call ? { receiver_call: typed.call } : {}),
+    ...(typed?.self ? { self: true } : {}),
+  };
+}
+
+// A call expression as a nested call description, or null.
+function callOf(expr, ctx, depth) {
+  if (depth > 3 || expr?.type !== 'call_expression') return null;
+  const callee = expr.childForFieldName('function');
+  if (callee?.type === 'identifier') return { method: callee.text, receiver: '', function: true };
+  if (callee?.type !== 'member_expression') return null;
+  const object = callee.childForFieldName('object');
+  const property = callee.childForFieldName('property');
+  if (!object || !property || (object.type === 'identifier' && GLOBAL_OBJECTS.has(object.text))) return null;
+  return describeCall(property.text, object.text, receiverType(object, ctx, depth + 1));
+}
+
+// The class an expression evaluates to, when the syntax tells: `this`, a
+// typed or `new`-initialised field or variable, a parameter typed in TS or
+// JSDoc, `new X()`, or a capitalised identifier used as a class (static call).
+function receiverType(expr, ctx, depth = 0) {
+  if (depth > 3) return null;
+  switch (expr.type) {
+    case 'call_expression': {
+      const call = callOf(expr, ctx, depth);
+      return call ? { call } : null;
+    }
+    case 'await_expression':
+      return expr.namedChild(0) ? receiverType(expr.namedChild(0), ctx, depth + 1) : null;
+    case 'this': {
+      const cls = enclosingClass(expr);
+      return cls ? { type: cls.name, self: true } : null;
+    }
+    case 'parenthesized_expression':
+    case 'non_null_expression':
+      return expr.namedChild(0) ? receiverType(expr.namedChild(0), ctx) : null;
+    case 'as_expression':
+    case 'satisfies_expression': {
+      const type = typeName(expr.namedChild(1));
+      return type ? { type } : null;
+    }
+    case 'new_expression': {
+      const ctor = expr.childForFieldName('constructor');
+      return ctor?.type === 'identifier' ? { type: ctor.text } : null;
+    }
+    case 'member_expression': {
+      if (expr.childForFieldName('object')?.type !== 'this') return null;
+      const cls = enclosingClass(expr);
+      const type = cls ? fieldType(cls.node, expr.childForFieldName('property')?.text, ctx) : null;
+      return type ? { type } : null;
+    }
+    case 'identifier': {
+      const binding = localBinding(expr);
+      if (binding) {
+        if (binding.type) return { type: binding.type };
+        const call = binding.value ? callOf(binding.value.type === 'await_expression' ? binding.value.namedChild(0) : binding.value, ctx, depth) : null;
+        return call ? { call } : null;
+      }
+      return /^[A-Z]/.test(expr.text) ? { type: expr.text } : null;
+    }
+    default:
+      return null;
+  }
+}
+
+// The class whose `this` an expression sees (arrow functions keep it,
+// other functions rebind it).
+function enclosingClass(node) {
+  for (let cur = node.parent; cur; cur = cur.parent) {
+    if (CLASS_TYPES.has(cur.type)) {
+      const name = cur.childForFieldName('name')?.text;
+      return name ? { node: cur, name } : null;
+    }
+    if (cur.type !== 'arrow_function' && cur.type !== 'method_definition' && FUNCTION_TYPES.has(cur.type)) return null;
+  }
+  return null;
+}
+
+// Type of `this.<field>`: a typed or `new`-initialised field, a TS constructor
+// parameter property, or `this.field = new X()` / `this.field = typedParam`.
+function fieldType(classNode, field, ctx) {
+  if (!field) return null;
+  ctx.fieldTypes ||= new Map();
+  if (!ctx.fieldTypes.has(classNode.id)) ctx.fieldTypes.set(classNode.id, collectFieldTypes(classNode));
+  return ctx.fieldTypes.get(classNode.id).get(field) ?? null;
+}
+
+function collectFieldTypes(classNode) {
+  const types = new Map();
+  const set = (name, type) => { if (name && type && !types.has(name)) types.set(name, type); };
+  const body = classNode.childForFieldName('body');
+  if (!body) return types;
+  for (const member of body.namedChildren) {
+    if (member.type === 'public_field_definition' || member.type === 'field_definition') {
+      const name = (member.childForFieldName('name') || member.childForFieldName('property'))?.text;
+      set(name, typeName(member.childForFieldName('type')) || newExpressionType(member.childForFieldName('value')));
+    }
+    if (member.type !== 'method_definition') continue;
+    const params = parameterTypes(member);
+    if (member.childForFieldName('name')?.text === 'constructor') {
+      for (const param of member.childForFieldName('parameters')?.namedChildren || []) {
+        if (param.namedChildren.some(c => c.type === 'accessibility_modifier' || c.text === 'readonly')) {
+          const name = param.childForFieldName('pattern')?.text;
+          set(name, params.get(name));
+        }
+      }
+    }
+    walkTree(member.childForFieldName('body'), (n) => {
+      if (n.type !== 'assignment_expression') return;
+      const left = n.childForFieldName('left');
+      const right = n.childForFieldName('right');
+      if (left?.type !== 'member_expression' || left.childForFieldName('object')?.type !== 'this' || !right) return;
+      const name = left.childForFieldName('property')?.text;
+      set(name, newExpressionType(right) || (right.type === 'identifier' ? params.get(right.text) : null));
+    });
+  }
+  return types;
+}
+
+// Nearest declaration of an identifier: { type } (type may be null when the
+// declaration does not tell), or null when it is not declared locally.
+function localBinding(identifier, { includeModule = true } = {}) {
+  const name = identifier.text;
+  for (let cur = identifier.parent; cur; cur = cur.parent) {
+    if (!includeModule && cur.type === 'program') return null;
+    if (FUNCTION_TYPES.has(cur.type)) {
+      const params = parameterTypes(cur);
+      if (params.has(name)) return { type: params.get(name) };
+    }
+    if (cur.type === 'statement_block' || cur.type === 'program') {
+      for (const stmt of cur.namedChildren) {
+        if (stmt.type !== 'lexical_declaration' && stmt.type !== 'variable_declaration') continue;
+        for (const decl of stmt.namedChildren) {
+          if (decl.type === 'variable_declarator' && decl.childForFieldName('name')?.text === name) {
+            const value = decl.childForFieldName('value');
+            return { type: typeName(decl.childForFieldName('type')) || newExpressionType(value), value };
+          }
+        }
+      }
+    }
+    if ((cur.type === 'for_in_statement' || cur.type === 'catch_clause') && cur.text.includes(name)) {
+      const left = cur.childForFieldName('left') || cur.childForFieldName('parameter');
+      if (left && left.text.split(/\W+/).includes(name)) return { type: null };
+    }
+  }
+  return null;
+}
+
+// Parameter name -> class name, from TS annotations or JSDoc `@param {T} name`.
+function parameterTypes(fnNode) {
+  const types = new Map();
+  const params = fnNode.childForFieldName('parameters') || fnNode.childForFieldName('parameter');
+  const doc = jsdocParamTypes(fnNode);
+  const add = (pattern, typeNode) => {
+    if (!pattern) return;
+    if (pattern.type === 'identifier') types.set(pattern.text, typeName(typeNode) || doc.get(pattern.text) || null);
+    else for (const id of identifiersIn(pattern)) if (!types.has(id)) types.set(id, null);
+  };
+  if (params?.type === 'identifier') add(params, null);
+  for (const param of params?.namedChildren || []) {
+    if (param.type === 'required_parameter' || param.type === 'optional_parameter') add(param.childForFieldName('pattern'), param.childForFieldName('type'));
+    else if (param.type === 'assignment_pattern') add(param.childForFieldName('left'), null);
+    else add(param, null);
+  }
+  return types;
+}
+
+function jsdocParamTypes(fnNode) {
+  const types = new Map();
+  let target = fnNode;
+  // `const f = (a) => ...` and `export function f` carry the comment on the statement.
+  while (target.parent && ['variable_declarator', 'lexical_declaration', 'variable_declaration', 'export_statement', 'pair'].includes(target.parent.type)) target = target.parent;
+  const doc = extractLeadingDoc(fnNode) || extractLeadingDoc(target);
+  if (!doc) return types;
+  for (const m of doc.matchAll(/@param\s+\{([^}]+)\}\s+\[?([\w$]+)/g)) {
+    const type = jsdocTypeName(m[1]);
+    if (type) types.set(m[2], type);
+  }
+  return types;
+}
+
+// A function whose every `return` is `new X(...)` (or an arrow `=> new X()`)
+// returns X. Nested functions are not looked into.
+export function constructedReturnType(fnNode) {
+  const body = fnNode.childForFieldName('body');
+  if (!body) return null;
+  if (body.type !== 'statement_block') return newExpressionType(body);
+  const types = new Set();
+  let returns = 0;
+  const visit = (n) => {
+    if (n !== body && FUNCTION_TYPES.has(n.type)) return;
+    if (n.type === 'return_statement') {
+      returns++;
+      types.add(newExpressionType(n.namedChild(0)));
+    }
+    for (let i = 0; i < n.namedChildCount; i++) visit(n.namedChild(i));
+  };
+  visit(body);
+  return returns > 0 && types.size === 1 ? [...types][0] : null;
+}
+
+// `@returns {Foo}` / `@return {Promise<Foo>}` -> `Foo` / `Promise<Foo>`.
+function jsdocReturnType(doc) {
+  const m = doc?.match(/@returns?\s+\{([^}]+)\}/);
+  if (!m) return null;
+  const inner = m[1].trim().match(/^(Promise|Awaited)<(.+)>$/s);
+  const name = jsdocTypeName(inner ? inner[2] : m[1]);
+  return name ? (inner ? `Promise<${name}>` : name) : null;
+}
+
+// `{GraphStore}`, `{?Foo}`, `{import('./x.js').Foo}`, `{Foo|null}` -> class name.
+function jsdocTypeName(text) {
+  const members = text.split('|').map(t => t.trim().replace(/^[?!]/, '')).filter(t => t && !/^(null|undefined)$/.test(t));
+  if (members.length !== 1) return null;
+  const name = members[0].replace(/<.*$/, '').split('.').pop().replace(/\W/g, '');
+  return /^[A-Z]/.test(name) ? name : null;
+}
+
+// Class name from a type annotation (`: Foo<Bar>`, `Foo | null`, `ns.Foo`).
+function typeName(node) {
+  if (!node) return null;
+  if (node.type === 'type_annotation') return node.namedChild(0) ? typeName(node.namedChild(0)) : null;
+  switch (node.type) {
+    case 'type_identifier':
+      return node.text;
+    case 'generic_type':
+      return typeName(node.childForFieldName('name') || node.namedChild(0));
+    case 'nested_type_identifier':
+      return node.namedChildren.at(-1)?.text ?? null;
+    case 'union_type': {
+      const members = node.namedChildren.filter(c => c.type !== 'literal_type' && c.type !== 'predefined_type');
+      return members.length === 1 ? typeName(members[0]) : null;
+    }
+    case 'parenthesized_type':
+      return node.namedChild(0) ? typeName(node.namedChild(0)) : null;
+    default:
+      return null;
+  }
+}
+
+function newExpressionType(node) {
+  if (node?.type === 'await_expression') return newExpressionType(node.namedChild(0));
+  if (node?.type !== 'new_expression') return null;
+  const ctor = node.childForFieldName('constructor');
+  return ctor?.type === 'identifier' ? ctor.text : null;
+}
+
+function identifiersIn(node) {
+  const ids = [];
+  walkTree(node, (n) => {
+    if (n.type === 'identifier' || n.type === 'shorthand_property_identifier_pattern') ids.push(n.text);
+  });
+  return ids;
+}
+
+function walkTree(node, visit) {
+  if (!node) return;
+  visit(node);
+  for (let i = 0; i < node.namedChildCount; i++) walkTree(node.namedChild(i), visit);
 }
 
 function walkFunctionBody(bodyNode, scope, ctx) {
@@ -801,6 +1228,10 @@ function walkBodyRecursive(node, scope, ctx) {
 
   if (node.type === 'member_expression') {
     extractEnvAccess(node, scope, ctx);
+  }
+
+  if (node.type === 'identifier' || node.type === 'shorthand_property_identifier') {
+    extractValueReference(node, scope, ctx);
   }
 
   if (node.type === 'jsx_element' || node.type === 'jsx_self_closing_element') {
@@ -838,6 +1269,7 @@ function extractJsxRendering(node, scope, ctx) {
       target_symbol: tagName,
       target_kind: 'component',
       kind: 'renders',
+      metadata: { line: tagNameNode.startPosition.row + 1 },
     }));
   }
 }

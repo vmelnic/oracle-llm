@@ -100,7 +100,9 @@ export class WeightsThenPatch {
     return this.driftLog;
   }
 
-  validateSynthesis(l3Result, allowedEvidence, subprojectId) {
+  // `mentionablePaths`: paths the answer may name but not cite as evidence,
+  // e.g. new files suggested by where_would (they don't exist yet).
+  validateSynthesis(l3Result, allowedEvidence, _subprojectId, { mentionablePaths = [] } = {}) {
     const text = l3Result?.text;
     const evidence = l3Result?.evidence;
     if (typeof text !== 'string' || !text.trim() || !Array.isArray(evidence) || evidence.length === 0) {
@@ -129,8 +131,13 @@ export class WeightsThenPatch {
     }
 
     const referencedPaths = text.match(/(?:[a-zA-Z0-9_.-]+\/)+[a-zA-Z0-9_.-]+\.(?:js|jsx|mjs|cjs|ts|tsx|php|dart|vue|py|go|rs|java|sql|ya?ml|json|proto|graphql)/g) || [];
+    const mentionable = new Set(mentionablePaths.map(p => normalizeEvidencePath(p, evidenceRoot)));
+    const known = [...allowed.keys(), ...mentionable];
     for (const referenced of referencedPaths) {
-      if (!allowed.has(normalizeEvidencePath(referenced, evidenceRoot))) {
+      const key = normalizeEvidencePath(referenced, evidenceRoot);
+      // A shortened real path ("retrieval/index.js" for src/retrieval/index.js)
+      // names a known file; only paths matching nothing known are inventions.
+      if (!known.some(k => k === key || k.endsWith(`/${key}`))) {
         return { accepted: false, reason: `L3 referenced a path outside the L1 allowlist: ${referenced}` };
       }
     }

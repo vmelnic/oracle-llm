@@ -1,13 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import fg from 'fast-glob';
+import { globFiles } from '../../utils/glob.js';
 
 export class ProtobufDetector {
   async detect(subproject) {
     const surfaces = [];
-    const protoFiles = await fg(
+    const protoFiles = await globFiles(
       ['**/*.proto'],
-      { cwd: subproject.root, absolute: true, ignore: ['node_modules/**', 'vendor/**'] }
+      { cwd: subproject.root, absolute: true, ignore: ['**/vendor/**'] }
     );
 
     for (const f of protoFiles) {
