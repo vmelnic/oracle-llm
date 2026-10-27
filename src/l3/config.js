@@ -14,7 +14,7 @@ export function l3Config(env = process.env) {
     baseUrl: value('ORACLE_L3_BASE_URL'),
     apiKey: value('ORACLE_L3_API_KEY'),
     model: value('ORACLE_L3_MODEL') || 'default',
-    timeoutMs: positiveInt(value('ORACLE_L3_TIMEOUT_MS'), 60_000),
+    timeoutMs: positiveInt(value('ORACLE_L3_TIMEOUT_MS'), 180_000),
     retries: nonNegativeInt(value('ORACLE_L3_RETRIES'), 1),
     maxTokens: positiveInt(value('ORACLE_L3_MAX_TOKENS'), 32768),
     // Prompt budget for facts: each 1K tokens costs a few seconds of prefill
@@ -24,6 +24,7 @@ export function l3Config(env = process.env) {
     reasoningEffort: value('ORACLE_L3_REASONING_EFFORT'),
     extraBody: parseJsonObject(value('ORACLE_L3_EXTRA_BODY')),
     extraHeaders: parseJsonObject(value('ORACLE_L3_EXTRA_HEADERS')),
+    output: value('ORACLE_L3_OUTPUT') === 'text' ? 'text' : 'claims',
   };
 }
 

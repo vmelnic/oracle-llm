@@ -37,20 +37,36 @@ MCP request ─► tool (L1 graph + L2 retrieval)
                  │  (symbols as many as fit ORACLE_L3_CONTEXT_TOKENS, about 30% kept for the
                  │   call/render/use relations between them; the rest summarized in one line)
                  ▼
-           model ──► "… prose …  evidence: [1, 2]"
+           model ──► {"sentences": [{"text": "…", "claims": [
+                        {"type": "relation", "subject": "A", "relation": "calls", "object": "B", "fact": 9},
+                        {"type": "symbol", "symbol": "FileWatcher", "fact": 2}]}]}
                  │
                  ▼
-           grounding check: cited numbers must exist, every path the prose
-           names must come from the facts
+           claim check, sentence by sentence: a relation must be a graph
+           relation between two shown facts (a class stands for its members),
+           a symbol claim must cite that symbol's fact, a suggested file must
+           be one the tool suggested; every symbol or path the sentence names
+           needs a claim, and "A calls B and C" in words needs each of them
+           linked by a verified relation claim
+                 │  failing sentences dropped (drift logged); repeats and
+                 │  sentences past four omitted
+                 ▼
+           grounding check: cited facts and every path named must come from the facts
                  │
-        accepted ┴ rejected
+        accepted ┴ rejected (no sentence left, or more than half dropped)
            │          └─► response = plain L1/L2 result (drift logged)
            ▼
    response = L1/L2 result + layer: "L3"
-              _l3_synthesis       prose, [n] references spelled out as path:lines
-              _l3_citations       the facts it cited (path + line_range)
+              _l3_synthesis       the verified sentences, [n] spelled out as path:lines
+              _l3_citations       the facts they cite (path + line_range)
+              _l3_claims          { sentences, verified, dropped: [reasons] }
               _l3_synthesis_note  "Model-generated …; treat as untrusted"
 ```
+
+`ORACLE_L3_OUTPUT=text` switches to the older prose mode (`system.txt`: prose
+plus an `evidence: [n]` line, checked only for citations and paths), for
+backends that cannot return JSON. Claims mode sends
+`response_format: {"type": "json_object"}`; `ORACLE_L3_EXTRA_BODY` can override it.
 
 Properties that hold for any model:
 
@@ -82,7 +98,7 @@ L3 talks to any `/v1/chat/completions` endpoint. All settings are in `.env`
 | `ORACLE_L3_BASE_URL` | — | Endpoint base URL, e.g. `http://127.0.0.1:8321/v1` |
 | `ORACLE_L3_MODEL` | `default` | Model name sent in requests |
 | `ORACLE_L3_API_KEY` | — | Bearer token, if the backend needs one |
-| `ORACLE_L3_TIMEOUT_MS` | `60000` | Deadline per call, retries included |
+| `ORACLE_L3_TIMEOUT_MS` | `180000` | Deadline per call, retries included |
 | `ORACLE_L3_RETRIES` | `1` | Retries on 429 / 5xx / connection reset |
 | `ORACLE_L3_MAX_TOKENS` | `32768` | Answer length cap. With the local server the answer also stops when the prompt plus answer fill `ORACLE_LLM_CTX_SIZE`. An answer cut before its `evidence:` line is rejected as truncated |
 | `ORACLE_L3_TEMPERATURE` | `0.2` | Sampling temperature |
@@ -252,7 +268,8 @@ a value is an error, not literal braces in the prompt.
 
 | File | Placeholders | Used for |
 |---|---|---|
-| `system.txt` | — | System prompt (rules, citation format) |
+| `system.claims.txt` | — | System prompt in claims mode (default): JSON sentences with their claims |
+| `system.txt` | — | System prompt in text mode (`ORACLE_L3_OUTPUT=text`): prose plus an evidence line |
 | `user.txt` | `{{context}}`, `{{question}}` | User turn; the tag around `{{context}}` is the untrusted-data fence |
 | `question.context.txt` | `{{task}}` | Question for `oracle.context` |
 | `question.where_would.txt` | `{{intent}}` | Question for `oracle.where_would` |
@@ -264,8 +281,8 @@ a value is an error, not literal braces in the prompt.
 
 To customize, copy the directory, edit it and set `ORACLE_L3_PROMPTS_DIR`;
 restart the MCP server to pick up changes. Keep the `[{{id}}]` numbering in
-`fact.evidence.txt` and the "cite by number" rule in `system.txt`: citations
-are matched by number. The MCP tool names, descriptions and input schemas that
+`fact.evidence.txt` and the claim / "cite by number" format in
+`system.claims.txt` / `system.txt`: claims and citations are matched by number. The MCP tool names, descriptions and input schemas that
 clients show their model live in `prompts/mcp/tools.json`.
 
 ## Using the local model as an agent (pi)

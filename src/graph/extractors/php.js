@@ -1314,6 +1314,9 @@ function extractTopLevelExpressions(node, namespace, filePath, subprojectId, use
       if (cls === 'Route' && ROUTE_METHODS.has(method)) {
         extractLaravelRoute(child, method, filePath, subprojectId, useMap, namespace, nodes, edges);
       }
+      if (cls === 'Route' && (method === 'resource' || method === 'apiResource')) {
+        extractLaravelResource(child, method, filePath, subprojectId, useMap, namespace, nodes, edges);
+      }
 
       if ((cls === 'Event' && method === 'dispatch') || (method === 'dispatch')) {
         const argsNode = child.namedChildren.find(n => n.type === 'arguments');
@@ -1467,11 +1470,12 @@ function laravelRouteContext(node, useMap, namespace) {
     own.push({ method: callName(cur.parent), args: callArgs(cur.parent) });
   }
   const groupNames = names.length;
+  const groupName = names.join('');
   apply(own);
 
   // Group `as` prefixes only make a name together with the route's own name.
   const name = names.length > groupNames ? names.join('') : '';
-  return { prefixes, middleware: [...new Set(middleware.filter(Boolean))], name };
+  return { prefixes, middleware: [...new Set(middleware.filter(Boolean))], name, groupName, own };
 }
 
 // Calls of a chain, innermost (Route::prefix) first.
@@ -1533,7 +1537,7 @@ function joinRoutePath(parts) {
   return `/${segments.join('/')}`;
 }
 
-function extractLaravelRoute(node, method, filePath, subprojectId, useMap, namespace, nodes, _edges) {
+function extractLaravelRoute(node, method, filePath, subprojectId, useMap, namespace, nodes, edges) {
   const argsNode = node.namedChildren.find(n => n.type === 'arguments');
   if (!argsNode) return;
 
@@ -1555,63 +1559,112 @@ function extractLaravelRoute(node, method, filePath, subprojectId, useMap, names
   let action = null;
 
   if (args.length >= 2) {
-    const arrayArg = args[1].namedChildren.find(n => n.type === 'array_creation_expression');
-    if (arrayArg) {
-      const elements = arrayArg.namedChildren.filter(n => n.type === 'array_element_initializer');
+    const handler = args[1].namedChildren[0];
+    if (handler?.type === 'array_creation_expression') {
+      const elements = handler.namedChildren.filter(n => n.type === 'array_element_initializer');
       if (elements.length >= 2) {
-        const classAccess = elements[0].namedChildren.find(n => n.type === 'class_constant_access_expression');
-        if (classAccess) {
-          controller = classAccess.namedChildren.find(n => n.type === 'name')?.text ?? null;
-        }
-        const actionStr = elements[1].namedChildren.find(n => n.type === 'string');
-        const actionContent = actionStr?.namedChildren?.find(n => n.type === 'string_content');
-        action = actionContent?.text ?? null;
+        controller = classConstantName(elements[0].namedChildren.find(n => n.type === 'class_constant_access_expression'));
+        action = phpStringValue(elements[1]) || null;
       }
+    } else if (handler?.type === 'class_constant_access_expression') {
+      // Invokable controller: Route::get('/x', ShowReport::class).
+      controller = classConstantName(handler);
+      action = controller ? '__invoke' : null;
     }
   }
 
-  const httpMethod = verbs;
-  const symbol = `${httpMethod} ${routePath}`;
-  const isApiRoute = routePath.startsWith('/api') || routePath.startsWith('api');
+  pushLaravelRoute({ node, filePath, subprojectId, useMap, namespace, nodes, edges, verbs, routePath, controller, action, middleware: group.middleware, name: group.name });
+}
 
-  const metadata = {
-    method: httpMethod,
-    path: routePath,
-  };
-  if (controller) metadata.controller = resolveType(controller, useMap, namespace);
+// Route::resource / apiResource: the conventional actions, minus ->only()/->except().
+const RESOURCE_ACTIONS = [
+  ['index', 'GET', ''],
+  ['create', 'GET', '/create'],
+  ['store', 'POST', ''],
+  ['show', 'GET', '/{param}'],
+  ['edit', 'GET', '/{param}/edit'],
+  ['update', 'PUT|PATCH', '/{param}'],
+  ['destroy', 'DELETE', '/{param}'],
+];
+
+function extractLaravelResource(node, method, filePath, subprojectId, useMap, namespace, nodes, edges) {
+  const args = callArgs(node);
+  const resource = phpStringValue(args[0]);
+  if (!resource) return;
+  const controller = classConstantName(args[1]?.namedChildren.find(n => n.type === 'class_constant_access_expression'));
+  const group = laravelRouteContext(node, useMap, namespace);
+
+  let actions = RESOURCE_ACTIONS.filter(([a]) => method !== 'apiResource' || (a !== 'create' && a !== 'edit'));
+  for (const { method: m, args: a } of group.own) {
+    const listed = new Set(a.flatMap(arg => middlewareValues(arg, useMap, namespace)));
+    if (m === 'only') actions = actions.filter(([name]) => listed.has(name));
+    if (m === 'except') actions = actions.filter(([name]) => !listed.has(name));
+  }
+
+  // `photos.comments` -> /photos/{photo}/comments/{comment}
+  const parts = resource.split('.');
+  const param = (segment) => singularize(segment).replace(/-/g, '_');
+  const base = parts.map((seg, i) => (i < parts.length - 1 ? `${seg}/{${param(seg)}}` : seg)).join('/');
+  const leaf = param(parts[parts.length - 1]);
+  for (const [action, verbs, suffix] of actions) {
+    pushLaravelRoute({
+      node, filePath, subprojectId, useMap, namespace, nodes, edges, verbs,
+      routePath: joinRoutePath([...group.prefixes, base + suffix.replace('{param}', `{${leaf}}`)]),
+      controller, action,
+      middleware: group.middleware,
+      name: `${group.groupName}${resource}.${action}`,
+    });
+  }
+}
+
+function singularize(word) {
+  if (word.endsWith('ies')) return `${word.slice(0, -3)}y`;
+  if (/(ss|us|is)$/.test(word)) return word;
+  if (/(xes|ches|shes|sses)$/.test(word)) return word.slice(0, -2);
+  return word.replace(/s$/, '');
+}
+
+function classConstantName(node) {
+  if (!node) return null;
+  return node.namedChildren.find(n => n.type === 'name' || n.type === 'qualified_name')?.text ?? null;
+}
+
+// One route node (plus its api_endpoint twin) and the edge from the
+// controller action that serves it, as the other extractors record it.
+function pushLaravelRoute({ node, filePath, subprojectId, useMap, namespace, nodes, edges, verbs, routePath, controller, action, middleware, name }) {
+  const symbol = `${verbs} ${routePath}`;
+  const metadata = { method: verbs, path: routePath };
+  const controllerFqn = controller ? resolveType(controller, useMap, namespace) : null;
+  if (controllerFqn) metadata.controller = controllerFqn;
   if (action) metadata.action = action;
-  if (group.middleware.length > 0) metadata.middleware = group.middleware;
-  if (group.name) metadata.name = group.name;
+  if (middleware.length > 0) metadata.middleware = middleware;
+  if (name) metadata.name = name;
 
-  nodes.push({
+  const base = {
     subproject_id: subprojectId,
     path: filePath,
     lang: 'php',
-    symbol,
-    kind: 'route',
     parent_symbol: null,
     start_line: node.startPosition.row + 1,
     end_line: node.endPosition.row + 1,
     exported: true,
-    signature: symbol,
     doc: null,
     metadata,
-  });
-
-  if (isApiRoute) {
-    nodes.push({
+  };
+  nodes.push({ ...base, symbol, kind: 'route', signature: symbol });
+  if (routePath.startsWith('/api')) {
+    nodes.push({ ...base, symbol: `API ${symbol}`, kind: 'api_endpoint', signature: `API ${symbol}` });
+  }
+  if (controllerFqn && action) {
+    edges.push({
       subproject_id: subprojectId,
-      path: filePath,
-      lang: 'php',
-      symbol: `API ${symbol}`,
-      kind: 'api_endpoint',
-      parent_symbol: null,
-      start_line: node.startPosition.row + 1,
-      end_line: node.endPosition.row + 1,
-      exported: true,
-      signature: `API ${symbol}`,
-      doc: null,
-      metadata,
+      source_symbol: `${controllerFqn}::${action}`,
+      source_kind: 'method',
+      source_path: filePath,
+      target_symbol: symbol,
+      target_kind: 'route',
+      kind: 'serves_route',
+      metadata: { line: node.startPosition.row + 1 },
     });
   }
 }

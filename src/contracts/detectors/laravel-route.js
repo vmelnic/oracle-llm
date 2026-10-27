@@ -59,11 +59,14 @@ export class LaravelRouteDetector {
       const tableName = tableProp
         ? tableProp[1]
         : classMatch[1].replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase() + 's';
+      // Point at `$table = '...'` when present, else at the model class.
+      const at = tableProp ? tableProp.index : classMatch.index;
       surfaces.push({
         path: path.relative(subproject.root, f),
         symbol: `table:${tableName}`,
         kind: 'db_table',
         lang: 'php',
+        startLine: content.slice(0, at).split('\n').length,
         metadata: { type: 'eloquent_model', model: classMatch[1], table: tableName },
       });
     }

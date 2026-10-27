@@ -32,6 +32,7 @@ export class KafkaTopicDetector {
                 symbol: `kafka:${name}`,
                 kind: 'event',
                 lang: 'json',
+                startLine: Math.max(1, content.slice(0, Math.max(0, content.indexOf(JSON.stringify(name)))).split('\n').length),
                 metadata: { type: 'kafka_topic', topic: name, registry: path.basename(f) },
               });
             }
@@ -45,6 +46,7 @@ export class KafkaTopicDetector {
             symbol: `kafka:${m[1]}`,
             kind: 'event',
             lang: ext.slice(1),
+            startLine: content.slice(0, m.index).split('\n').length,
             metadata: { type: 'kafka_topic', topic: m[1], registry: path.basename(f) },
           });
         }

@@ -35,6 +35,8 @@ function truncateToTokenCap(obj, cap) {
   return shrink(JSON.parse(json), cap * 4);
 }
 
+const MIN_STRING_ROOM = 60;
+
 function shrink(value, budget) {
   if (typeof value === 'string') return value.length + 2 <= budget ? value : `${value.slice(0, Math.max(0, budget - 5))}...`;
   if (Array.isArray(value)) {
@@ -50,33 +52,50 @@ function shrink(value, budget) {
     return out;
   }
   if (value && typeof value === 'object') {
-    const out = {};
-    let used = 2;
-    const entries = Object.entries(value);
-    for (let i = 0; i < entries.length; i++) {
-      const [key, val] = entries[i];
+    // Fair shares, not first come first served: fields that fit their share
+    // stay whole (a 2-item `create` list survives next to a 300-item
+    // `existing` one), the rest of the budget is split evenly among the big
+    // fields, and each keeps its first items.
+    const fields = Object.entries(value).map(([key, val]) => {
       const keySize = JSON.stringify(key).length + 2;
-      const size = keySize + JSON.stringify(val).length;
-      // Leave room for the remaining keys' names so later fields survive too.
-      const reserve = entries.slice(i + 1).reduce((n, [k]) => n + JSON.stringify(k).length + 8, 0);
-      const room = budget - used - reserve;
+      return { key, val, keySize, size: keySize + JSON.stringify(val).length };
+    });
+    const allowance = new Map();
+    let remaining = budget - 2;
+    let pending = [...fields];
+    while (pending.length > 0) {
+      const share = remaining / pending.length;
+      const fit = pending.filter(f => f.size <= share);
+      if (fit.length === 0) {
+        for (const f of pending) allowance.set(f.key, share);
+        break;
+      }
+      for (const f of fit) {
+        allowance.set(f.key, f.size);
+        remaining -= f.size;
+      }
+      pending = pending.filter(f => f.size > share);
+    }
+
+    const out = {};
+    for (const { key, val, keySize, size } of fields) {
+      const room = allowance.get(key);
       if (size <= room) {
         out[key] = val;
-        used += size;
-      } else if (room > keySize + 8 && val && typeof val === 'object') {
-        const shrunk = shrink(val, room - keySize);
-        out[key] = shrunk;
-        used += keySize + JSON.stringify(shrunk).length;
-        if (Array.isArray(val) && shrunk.length < val.length) {
-          out[`${key}_total`] = val.length;
-          used += JSON.stringify(`${key}_total`).length + 8;
-        }
-      } else if (room > keySize + 8 && typeof val === 'string') {
-        out[key] = shrink(val, room - keySize);
-        used += keySize + JSON.stringify(out[key]).length;
       } else if (Array.isArray(val)) {
+        // Room for `<key>_total` is taken from the list's own share.
+        const totalSize = JSON.stringify(`${key}_total`).length + 8;
+        const shrunk = room > keySize + totalSize + 8 ? shrink(val, room - keySize - totalSize) : [];
+        if (shrunk.length > 0) out[key] = shrunk;
         out[`${key}_total`] = val.length;
-        used += JSON.stringify(`${key}_total`).length + 8;
+      } else if (val && typeof val === 'object' && room > keySize + 8) {
+        out[key] = shrink(val, room - keySize);
+      } else if (typeof val === 'string' && room - keySize >= MIN_STRING_ROOM) {
+        // Only prose is cut; a path or symbol cut to `app/H...` is noise, so it is left out.
+        out[key] = shrink(val, room - keySize);
+      } else if (val === null || (typeof val !== 'object' && typeof val !== 'string')) {
+        // Numbers, booleans and null cost a few characters: always kept.
+        out[key] = val;
       }
     }
     return out;
@@ -188,11 +207,9 @@ export class GroundingWrapper {
 
         // Qualified symbols (`Class.method`, `App\\Models\\User`, `Foo::bar`) appear
         // in source by their last segment only.
-        const symLower = evidence.symbol ? sourceName(evidence.symbol).toLowerCase() : '';
-        if (symLower) {
-          const citedText = lines.slice(start - 1, end).join('\n').toLowerCase();
-          if (!citedText.includes(symLower)) return false;
-        }
+        const names = evidence.symbol ? sourceNames(evidence.symbol, evidence.kind, evidence.path).map(n => n.toLowerCase()).filter(Boolean) : [];
+        const mentions = (text) => names.length === 0 || names.some(n => text.includes(n));
+        if (!mentions(lines.slice(start - 1, end).join('\n').toLowerCase())) return false;
 
         if (this.parser && evidence.symbol) {
           const lang = this.parser.languageFor(resolved);
@@ -210,9 +227,7 @@ export class GroundingWrapper {
               );
               if (nodeAtRange && !nodeAtRange.hasError) {
                 const nodeText = content.slice(nodeAtRange.startIndex, nodeAtRange.endIndex);
-                if (symLower && !nodeText.toLowerCase().includes(symLower)) {
-                  return false;
-                }
+                if (!mentions(nodeText.toLowerCase())) return false;
               }
             } catch {
               return false;
@@ -449,6 +464,26 @@ function extractFirstSymbol(answerObj) {
   return null;
 }
 
+// Names a symbol is spelled with in source (any one must appear).
+function sourceNames(symbol, kind, filePath) {
+  const text = String(symbol);
+  // File-level contracts (`openapi:<file>`, `schema:<file>`) name the file itself.
+  if (filePath && text.endsWith(`:${path.basename(filePath)}`)) return [];
+  // Test blocks (`describe GraphStore.locate`) are spelled by their title.
+  const test = text.match(/^(?:describe|it|test|context|suite)\s+(.+)$/);
+  if (test) return [test[1]];
+  // `module.exports = ...` and `export default ...` are named `default`.
+  if (text === 'default') return ['default', 'module.exports'];
+  const name = sourceName(text);
+  // A table named after its model (`course_statuses` for CourseStatus) may
+  // only appear as the class name.
+  if (kind === 'db_table') {
+    const joined = name.replace(/_/g, '');
+    return [name, joined.replace(/ies$/, 'y'), joined.replace(/es$/, ''), joined.replace(/s$/, '')];
+  }
+  return [name];
+}
+
 function sourceName(symbol) {
   const text = String(symbol);
   // Routes (`GET /courses/{id}/active`) appear by their last literal path
@@ -464,6 +499,11 @@ function sourceName(symbol) {
 // The synthesis travels with its untrusted-content note, never without it.
 function l3Fields(answer) {
   return answer._l3_synthesis
-    ? { _l3_synthesis: answer._l3_synthesis, _l3_citations: answer._l3_citations, _l3_synthesis_note: answer._l3_synthesis_note }
+    ? {
+      _l3_synthesis: answer._l3_synthesis,
+      _l3_citations: answer._l3_citations,
+      ...(answer._l3_claims ? { _l3_claims: answer._l3_claims } : {}),
+      _l3_synthesis_note: answer._l3_synthesis_note,
+    }
     : {};
 }

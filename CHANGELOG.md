@@ -35,6 +35,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- L3 claim-level verification (default, `ORACLE_L3_OUTPUT=claims`): the model answers in JSON (`prompts/l3/system.claims.txt`), each sentence listing its claims (relation "A calls/renders/uses B", symbol, suggested file) with the fact it relies on. A relation must exist in the graph between two shown facts (a class stands for its members), a symbol claim must cite that symbol's fact, every symbol or path a sentence names needs a claim, and a sentence stating a relation in words must have every function, method, class or component it names linked by a verified relation claim (types only need their symbol claim). Text is checked sentence by sentence and a failed claim only sinks the sentences that rely on it; failing sentences are dropped and logged, repeats and sentences past four are omitted, and the answer is rejected when none or less than half survive. `_l3_claims` reports the counts and reasons. `ORACLE_L3_OUTPUT=text` keeps the prose mode.
+- `oracle.where_would` names new files in the singular or plural as their neighbours do (`InvoiceController` among `UserController`, `orders_view` among plural views); timestamped names keep their words.
+
 - L3 facts include the verified relations between the facts ("A calls B (line N of path)", renders, uses), with about 30% of the fact budget kept for them; `system.txt` tells the model to describe flow only from these, not from names.
 - `oracle.context` also brings in what relevant code calls (two calls deep), weights down members matched only through their class name, properties and tests, and fills `ORACLE_CONTEXT_MAX_NODES` by evidence strength (task words in the symbol, then callers/callees, then semantic-only hits, then nearby code).
 - Method calls are part of the graph. Extractors (JS/TS, PHP, Dart) describe
@@ -114,6 +117,8 @@ All notable changes to this project are documented here. The format follows
 - MIT license.
 
 ### Changed
+
+- `ORACLE_L3_TIMEOUT_MS` defaults to 180000 (claims make answers longer; small local models need the time). Failed L3 calls (timeouts, backend errors) are recorded in the drift log.
 
 - `oracle.where_would` learns placement from the repository instead of picking the directory with the most classes. The intent's head noun is the role ("API *controller* for invoices"); its files are found by file-name suffix, parent directory or node kind. The proposal goes to the directory already holding that role for the feature, else the per-feature layout (`modules/<feature>/controllers`), else the main directory, with the alternative listed. Names copy the neighbours' prefix/suffix (`Api…Controller`, `use-…`), timestamp prefix, extension and casing; shared code ("reusable …") goes outside feature directories; tests and generated code are never proposed unless asked; an existing name is reported instead of inventing `name_2`.
 - `oracle.conventions_for` scores code by the topic's words in names, base types and paths (whole words and inflections: "log" matches logger, not login), and reports the base types the topic's code extends, where it lives, route middleware counts for auth/routing, matching patterns, documented rules and ranked examples. Any topic word works; multi-word topics say when only part of the words match.
@@ -199,8 +204,11 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
-- Laravel routes include their group prefixes and middleware (`Route::prefix()->middleware()->group()`, `Route::group([...])`, chained `->middleware()` / `->withoutMiddleware()` / `->name()`), and `Route::match` lists its verbs. Routes declared in different groups no longer collapse into the same symbol. Route patterns count auth middleware as authenticated.
-- Evidence for routes (`GET /users/{id}`) and contract ids (`migration:<file>:<table>`) is verified by the name the source spells out, so `oracle.conventions_for` / `oracle.where_would` answers citing them are no longer rejected.
+- Answers over the token cap are shortened by fair shares: small lists stay whole and the budget is split evenly among the big ones, so `oracle.context` keeps its `create` suggestions next to a long `existing` list instead of dropping them.
+
+- Laravel routes include their group prefixes and middleware (`Route::prefix()->middleware()->group()`, `Route::group([...])`, chained `->middleware()` / `->withoutMiddleware()` / `->name()`), `Route::match` lists its verbs, `Route::resource` / `apiResource` (with `->only()` / `->except()`) produce their routes, and invokable controllers are recognised. Routes declared in different groups no longer collapse into the same symbol. Each route is linked to its controller action (`serves_route`), as in the other extractors. Route patterns count auth middleware as authenticated.
+- `serves_route` edges (handler -> route) count the route as a user of its handler in `oracle.consumers`, `oracle.impact` and the emit gate: removing or changing a controller action now reports the routes it breaks.
+- Evidence is verified by the name the source actually spells: routes (`GET /users/{id}`) by their last path segment, contract ids (`migration:<file>:<table>`) by their last part, file-level contracts by the file, test blocks by their title, `module.exports` as `default`, and tables by their model class name. Contract detectors (Eloquent models, Doctrine migrations, Kafka topics) record the line they found, instead of line 1. Answers citing them are no longer marked unverified.
 
 - `oracle.context` returned the test pattern with all its members (hundreds of thousands of tokens before truncation); it now picks the pattern whose members mostly live in test files and returns its summary.
 - Every PHP method call was missing from the graph except calls on `$this`,

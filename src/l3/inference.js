@@ -14,11 +14,11 @@ export class L3InferenceEngine {
    * into the request, e.g. `{"chat_template_kwargs": {...}}`) and
    * `extraHeaders`. See l3Config() for the environment variables.
    */
-  constructor({ baseUrl, model, apiKey, timeoutMs, retries, maxTokens, contextTokens, temperature, reasoningEffort, extraBody, extraHeaders } = {}) {
+  constructor({ baseUrl, model, apiKey, timeoutMs, retries, maxTokens, contextTokens, temperature, reasoningEffort, extraBody, extraHeaders, output } = {}) {
     this.baseUrl = baseUrl;
     this.model = model || 'default';
     this.apiKey = apiKey;
-    this.timeoutMs = timeoutMs ?? positiveInt(process.env.ORACLE_L3_TIMEOUT_MS, 60_000);
+    this.timeoutMs = timeoutMs ?? positiveInt(process.env.ORACLE_L3_TIMEOUT_MS, 180_000);
     this.retries = retries ?? nonNegativeInt(process.env.ORACLE_L3_RETRIES, 1);
     this.maxTokens = maxTokens ?? 32768;
     this.contextTokens = contextTokens ?? 1500;
@@ -26,6 +26,9 @@ export class L3InferenceEngine {
     this.reasoningEffort = reasoningEffort || '';
     this.extraBody = extraBody || {};
     this.extraHeaders = extraHeaders || {};
+    // `claims`: JSON sentences with their claims, checked one by one
+    // (system.claims.txt); `text`: prose with an evidence line (system.txt).
+    this.output = output === 'text' ? 'text' : 'claims';
   }
 
   isAvailable() {
@@ -55,11 +58,14 @@ export class L3InferenceEngine {
       ...this.extraBody,
       model: this.model,
       messages: [
-        { role: 'system', content: renderTemplate('system.txt') },
+        { role: 'system', content: renderTemplate(this.output === 'claims' ? 'system.claims.txt' : 'system.txt') },
         { role: 'user', content: userContent },
       ],
       max_tokens: maxTokens,
       temperature,
+      // JSON mode where the backend supports it (llama.cpp, vLLM, OpenAI...);
+      // ORACLE_L3_EXTRA_BODY can override, ORACLE_L3_OUTPUT=text avoids it.
+      ...(this.output === 'claims' && !('response_format' in this.extraBody) ? { response_format: { type: 'json_object' } } : {}),
       ...(this.reasoningEffort ? { reasoning_effort: this.reasoningEffort } : {}),
     });
 

@@ -67,6 +67,7 @@ const MIN_ROLE_FILES = 2;
 // the project-wide convention.
 const LAYOUT_SHARE = 0.25;
 const AFFIX_SHARE = 0.5;
+const LOCAL_PREFIX_SHARE = 0.9;
 
 const TEST_PATH = /(^|\/)(tests?|__tests__|specs?|e2e|integration_test)\//i;
 const TEST_FILE = /(\.(test|spec)\.[^./]+$)|(_test\.[^./]+$)|(Test\.php$)/;
@@ -145,6 +146,12 @@ function parseIntent(intent) {
   let analogNext = false;
   for (const token of raw) {
     const lower = token.toLowerCase();
+    // The name after "similar to" is taken as written, even `Billing`.
+    if (analogNext && !BOUNDARY_WORDS.has(lower) && !STOP_WORDS.has(lower)) {
+      analogs.push(token);
+      analogNext = false;
+      continue;
+    }
     const isGerund = lower.length > 4 && lower.endsWith('ing');
     if (BOUNDARY_WORDS.has(lower) || (isGerund && head.length > 0)) {
       if (['similar', 'like', 'same', 'based'].includes(lower)) analogNext = true;
@@ -153,11 +160,6 @@ function parseIntent(intent) {
       continue;
     }
     if (STOP_WORDS.has(lower) && !(!inHead && ['add', 'create', 'remove', 'drop', 'update', 'change'].includes(lower))) {
-      continue;
-    }
-    if (analogNext) {
-      analogs.push(token);
-      analogNext = false;
       continue;
     }
     if (inHead) {
@@ -338,15 +340,19 @@ function buildProposal(store, subId, placement, parsed, domain, role, files) {
   const siblings = placement.siblings.filter(Boolean);
   if (siblings.length === 0) return null;
   const stems = siblings.map(fileStem);
-  const convention = namingConvention(stems, siblings, role ? [...role.weights.keys()] : siblings);
+  const convention = namingConvention(stems, siblings, role ? [...role.weights.keys()] : siblings, directoryWords(files));
   const roleTerms = new Set([role?.word, ...(ROLE_SYNONYMS[role?.word] || [])].filter(Boolean));
 
   let dir = placement.dir;
   let featureDir = null;
   const domainName = domain[0] ? domain[0] : null;
+  // Feature directories named like the existing ones: Course/, Taxonomy/ -> Invoice/.
+  const featureName = (dirNames) => applyStyle(
+    domainName ? withNumber(nameWords(domainName), grammaticalNumber(dirNames)) : ['new', 'feature'],
+    detectStyle(dirNames),
+  );
   if (placement.kind === 'feature') {
-    const values = [...placement.values.keys()];
-    featureDir = applyStyle(nameWords(domainName || 'new feature'), detectStyle(values));
+    featureDir = featureName([...placement.values.keys()]);
     dir = placement.template.replace('*', featureDir);
   }
 
@@ -362,14 +368,16 @@ function buildProposal(store, subId, placement, parsed, domain, role, files) {
   if (convention.fixedName) {
     // Every feature has the same file (page.tsx, index.ts): the name goes on the directory.
     if (placement.kind !== 'feature') {
-      featureDir = applyStyle(nameWords(domainName || 'new feature'), detectStyle(siblingDirNames(siblings)));
+      featureDir = featureName(siblingDirNames(siblings));
       dir = path.posix.join(dir, featureDir);
     }
     base = convention.fixedName;
   } else {
+    // A timestamped name describes the change ("add_status_to_orders") and
+    // keeps its words; other names follow the neighbours' singular/plural.
     const body = convention.timestamp && parsed.sentence.length > 0
       ? pick(parsed.sentence, false)
-      : pick(domain, parsed.domainFromHead);
+      : withNumber(pick(domain, parsed.domainFromHead), grammaticalNumber(stems, convention));
     const words = body.length > 0 ? body : ['new', role?.word || 'module'];
     const all = [
       ...(convention.timestamp ? [] : convention.prefix ? [convention.prefix] : []),
@@ -437,14 +445,15 @@ function mainNode(store, subId, file, anchor, role) {
   if (nodes.length === 0) return null;
   const roleKinds = new Set(ROLE_KINDS[role?.word] || []);
   const rank = { class: 1, component: 1, interface: 2, trait: 2, mixin: 2, hook: 2, migration: 2, function: 3, enum: 3, db_table: 4 };
-  const rankOf = (n) => (roleKinds.has(n.kind) ? 0 : rank[n.kind] ?? 5);
+  // A table is derived from the model class: the class is the example to copy.
+  const rankOf = (n) => (roleKinds.has(n.kind) && n.kind !== 'db_table' ? 0 : rank[n.kind] ?? 5);
   return nodes.sort((a, b) => rankOf(a) - rankOf(b) || (b.exported ? 1 : 0) - (a.exported ? 1 : 0) || a.start_line - b.start_line)[0];
 }
 
 // ---------------------------------------------------------------------------
 // Naming conventions
 
-function namingConvention(stems, siblings, roleFiles) {
+function namingConvention(stems, siblings, roleFiles, dirWords = new Set()) {
   const ext = mostCommon(siblings.map(fileExt).filter(Boolean)) || '.js';
   const style = detectStyle(stems);
   const share = (n) => n / stems.length;
@@ -464,16 +473,22 @@ function namingConvention(stems, siblings, roleFiles) {
   const dirsOf = (pick, word) => new Set(roleFiles.filter(f => pick(nameWords(fileStem(f).replace(stampRe, ''))) === word)
     .map(f => path.posix.dirname(f))).size;
   // An affix is a convention when most of the role's files carry it, here
-  // and across the project. A prefix must also span several directories:
-  // `Course...` shared by one feature's files is a domain word, `Api...`
-  // or `use-...` everywhere is a convention.
+  // and across the project. A prefix must also span several directories or
+  // be no directory's name: `Course...` shared by one feature's files is a
+  // domain word (there is a Course/ directory), `Api...` across features or
+  // `use-...` in a single hooks/ directory is a convention.
   const affix = (pick, needsSpread) => {
     const source = local.length >= 2 ? local : global;
     const top = mostCommonEntry(source.map(pick));
     if (!top || top[1] / source.length < AFFIX_SHARE) return null;
     const support = global.filter(w => pick(w) === top[0]).length;
     if (global.length === 0 || support / global.length < AFFIX_SHARE) return null;
-    if (needsSpread && dirsOf(pick, top[0]) < MIN_FEATURES) return null;
+    if (needsSpread && dirsOf(pick, top[0]) < MIN_FEATURES) {
+      // Within one directory only a near-universal prefix that names no
+      // directory counts: `use-` on every hook, not `Send...` on 2 of 3 listeners.
+      const universal = support >= MIN_FEATURES && support / global.length >= LOCAL_PREFIX_SHARE;
+      if (!universal || dirWords.has(singular(top[0]))) return null;
+    }
     return top[0];
   };
   return {
@@ -502,6 +517,50 @@ function newTimestamp(shape) {
     digits = digits.slice(n);
     return part;
   });
+}
+
+// Whether the neighbours name things in the singular (CourseController,
+// UserController) or the plural (alerts_controller, orders_view): judged on
+// the last word before the role suffix, only when at least 70% agree.
+const NUMBER_SHARE = 0.7;
+
+function grammaticalNumber(names, convention = {}) {
+  const affixes = new Set([convention.prefix, convention.suffix].filter(Boolean));
+  const nouns = [];
+  for (const name of names) {
+    const words = nameWords(String(name).replace(/^\d+(?:[_-]\d+)*[_-]/, '')).filter(w => !affixes.has(w));
+    const last = words[words.length - 1];
+    if (last && last.length > 3 && /^[a-z]+$/.test(last)) nouns.push(last);
+  }
+  if (nouns.length < MIN_FEATURES) return null;
+  const plural = nouns.filter(w => singular(w) !== w).length / nouns.length;
+  if (plural >= NUMBER_SHARE) return 'plural';
+  if (plural <= 1 - NUMBER_SHARE) return 'singular';
+  return null;
+}
+
+// Singular: every word ("invoices state" -> invoice state). Plural: the head
+// noun only, the last word ("invoice" -> invoices).
+function withNumber(words, number) {
+  if (!number || words.length === 0) return words;
+  const singularWords = words.map(singular);
+  if (number === 'singular') return singularWords;
+  return [...singularWords.slice(0, -1), plural(singularWords[singularWords.length - 1])];
+}
+
+function plural(word) {
+  if (/[^aeiou]y$/.test(word)) return `${word.slice(0, -1)}ies`;
+  if (/(s|x|z|ch|sh)$/.test(word)) return `${word}es`;
+  return `${word}s`;
+}
+
+// Every word used in a directory name of the subproject.
+function directoryWords(files) {
+  const words = new Set();
+  for (const f of files) {
+    for (const seg of path.posix.dirname(f).split('/')) for (const w of nameWords(seg)) words.add(singular(w));
+  }
+  return words;
 }
 
 function siblingDirNames(files) {

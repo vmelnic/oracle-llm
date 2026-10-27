@@ -23,7 +23,7 @@ export class DoctrineMigrationDetector {
         /createTable\s*\(\s*['"](\w+)['"]|->createTable\s*\(\s*['"](\w+)['"]|Schema::create\s*\(\s*['"](\w+)['"]/gi
       );
       for (const m of createMatches) {
-        tablesCreated.push(m[1] || m[2] || m[3]);
+        tablesCreated.push({ table: m[1] || m[2] || m[3], index: m.index });
       }
 
       const tablesAltered = [];
@@ -31,7 +31,7 @@ export class DoctrineMigrationDetector {
         /->alterTable\s*\(\s*['"](\w+)['"]|Schema::table\s*\(\s*['"](\w+)['"]|addSql\(['"].*ALTER\s+TABLE\s+(\w+)/gi
       );
       for (const m of alterMatches) {
-        tablesAltered.push(m[1] || m[2] || m[3]);
+        tablesAltered.push({ table: m[1] || m[2] || m[3], index: m.index });
       }
 
       if (tablesCreated.length === 0 && tablesAltered.length === 0) {
@@ -46,7 +46,8 @@ export class DoctrineMigrationDetector {
         continue;
       }
 
-      for (const table of tablesCreated) {
+      const lineAt = (index) => content.slice(0, index).split('\n').length;
+      for (const { table, index } of tablesCreated) {
         const colMatches = content.matchAll(/addColumn\s*\(\s*['"](\w+)['"]\s*,\s*['"](\w+)['"]/g);
         const columns = [];
         for (const cm of colMatches) {
@@ -57,6 +58,7 @@ export class DoctrineMigrationDetector {
           symbol: `doctrine:${table}`,
           kind: 'migration',
           lang: 'php',
+          startLine: lineAt(index),
           metadata: {
             type: 'doctrine_migration',
             table,
@@ -68,12 +70,13 @@ export class DoctrineMigrationDetector {
         });
       }
 
-      for (const table of tablesAltered) {
+      for (const { table, index } of tablesAltered) {
         surfaces.push({
           path: path.relative(subproject.root, f),
           symbol: `doctrine_alter:${table}`,
           kind: 'migration',
           lang: 'php',
+          startLine: lineAt(index),
           metadata: {
             type: 'doctrine_migration',
             table,

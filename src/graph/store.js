@@ -96,10 +96,16 @@ export class GraphStore {
         RETURNING id
       `),
 
+      // A route uses the handler that serves it: `serves_route` edges point
+      // from the handler to the route, so they count in the other direction.
       getConsumers: this.db.prepare(`
         SELECT n.* FROM nodes n
         JOIN edges e ON e.source_id = n.id
-        WHERE e.target_id = ?
+        WHERE e.target_id = @id AND e.kind != 'serves_route'
+        UNION
+        SELECT n.* FROM nodes n
+        JOIN edges e ON e.target_id = n.id
+        WHERE e.source_id = @id AND e.kind = 'serves_route'
       `),
 
       getProducers: this.db.prepare(`
@@ -225,14 +231,24 @@ export class GraphStore {
       `),
 
       consumersOneHop: this.db.prepare(`
+        SELECT * FROM (
         SELECT DISTINCT n.id, n.subproject_id, n.path, n.lang, n.symbol, n.kind,
                n.parent_id, n.start_line, n.end_line, n.exported, n.signature, n.doc,
                n.commit_sha, n.file_blob_hash, n.metadata,
                e.kind AS edge_kind, e.metadata AS edge_metadata
         FROM edges e
         JOIN nodes n ON e.source_id = n.id
-        WHERE e.target_id = ?
-        ORDER BY CASE e.kind WHEN 'calls' THEN 0 ELSE 1 END, n.path, n.start_line
+        WHERE e.target_id = @id AND e.kind != 'serves_route'
+        UNION
+        SELECT DISTINCT n.id, n.subproject_id, n.path, n.lang, n.symbol, n.kind,
+               n.parent_id, n.start_line, n.end_line, n.exported, n.signature, n.doc,
+               n.commit_sha, n.file_blob_hash, n.metadata,
+               e.kind AS edge_kind, e.metadata AS edge_metadata
+        FROM edges e
+        JOIN nodes n ON e.target_id = n.id
+        WHERE e.source_id = @id AND e.kind = 'serves_route'
+        )
+        ORDER BY CASE edge_kind WHEN 'calls' THEN 0 ELSE 1 END, path, start_line
       `),
 
       impactOneHop: this.db.prepare(`
@@ -242,7 +258,15 @@ export class GraphStore {
                e.kind AS edge_kind
         FROM edges e
         JOIN nodes n ON e.source_id = n.id
-        WHERE e.target_id = ?
+        WHERE e.target_id = @id AND e.kind != 'serves_route'
+        UNION
+        SELECT DISTINCT n.id, n.subproject_id, n.path, n.lang, n.symbol, n.kind,
+               n.parent_id, n.start_line, n.end_line, n.exported, n.signature, n.doc,
+               n.commit_sha, n.file_blob_hash, n.metadata,
+               e.kind AS edge_kind
+        FROM edges e
+        JOIN nodes n ON e.target_id = n.id
+        WHERE e.source_id = @id AND e.kind = 'serves_route'
       `),
     };
   }
@@ -409,7 +433,7 @@ export class GraphStore {
   }
 
   getConsumers(nodeId) {
-    return this._stmts.getConsumers.all(nodeId);
+    return this._stmts.getConsumers.all({ id: nodeId });
   }
 
   getProducers(nodeId) {
@@ -552,7 +576,7 @@ export class GraphStore {
     for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
       const nextFrontier = [];
       for (const nid of frontier) {
-        for (const row of this._stmts.consumersOneHop.all(nid)) {
+        for (const row of this._stmts.consumersOneHop.all({ id: nid })) {
           if (visited.has(row.id)) continue;
           visited.add(row.id);
           result.push({ ...row, depth: depth + 1 });
@@ -576,7 +600,7 @@ export class GraphStore {
     for (let depth = 0; depth < maxDepth && frontier.length > 0; depth++) {
       const nextFrontier = [];
       for (const nid of frontier) {
-        const rows = this._stmts.impactOneHop.all(nid);
+        const rows = this._stmts.impactOneHop.all({ id: nid });
         for (const row of rows) {
           if (!visited.has(row.id)) {
             visited.add(row.id);

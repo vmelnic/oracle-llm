@@ -13,7 +13,7 @@ const extractorCache = new Map();
 // Bump whenever extractor output or edge resolution changes: a graph built
 // with another version is re-extracted in full on the next build, since
 // unchanged files would otherwise keep their old nodes and edges.
-const EXTRACTOR_VERSION = 5;
+const EXTRACTOR_VERSION = 7;
 const EXTRACTOR_VERSION_KEY = 'extractor_version';
 const MAX_EDGE_LINES = 20;
 

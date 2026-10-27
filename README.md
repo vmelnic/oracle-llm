@@ -114,8 +114,11 @@ node bin/oracle.js llm bench <workspace_id> <subproject_id>   # L3 speed + groun
 With L3 on, `oracle.context`, `oracle.where_would` and `oracle.conventions_for`
 also return `_l3_synthesis`: a short answer written by a language model from
 the verified L1/L2 facts only, with `_l3_citations` pointing at the facts it
-used. The model cites facts by number; an answer citing anything that isn't a
-verified fact is dropped and the plain L1/L2 result is returned. Broad
+used. The model answers in JSON, listing for every sentence the claims it makes
+("A calls B", "symbol X is fact 3"); each claim is checked against the facts
+and the graph relations between them, sentences with an unsupported claim are
+dropped (`_l3_claims` says how many and why), and when nothing or less than
+half survives the plain L1/L2 result is returned. Broad
 questions ("how does login work") consider every related symbol and its
 callers, not a fixed top few.
 

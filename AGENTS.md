@@ -21,7 +21,7 @@
 The architecture has three layers:
 - **L1 — Deterministic** (implemented): entity graph, pattern catalogue, project manifest, contract registry.
 - **L2 — AST-aware retrieval** (implemented): BM25-based retrieval over AST node summaries. Augments `oracle.context` when keyword matching is sparse.
-- **L3 — Synthesis** (implemented, optional): `context`, `where_would` and `conventions_for` add a short model-written answer built only from the verified L1/L2 facts, which the model cites by number; answers citing anything else are dropped. Any OpenAI-compatible backend; the repo can run a local llama.cpp server (`oracle llm …`). See `docs/l3-local-model.md`.
+- **L3 — Synthesis** (implemented, optional): `context`, `where_would` and `conventions_for` add a short model-written answer built only from the verified L1/L2 facts. The model returns JSON sentences with the claims they make; each claim is checked against the facts and graph relations (`src/l3/claims.js`), unsupported sentences are dropped, and the answer is dropped when none or less than half survive. Any OpenAI-compatible backend; the repo can run a local llama.cpp server (`oracle llm …`). See `docs/l3-local-model.md`.
 
 Additional features:
 - **Emit Gate** (`src/emit-gate/`): pre-commit validation pipeline (tree-sitter parse, `oracle.validate`, `oracle.impact`, test runner detection, LSP type-check via robust JSON-RPC).
@@ -147,7 +147,8 @@ llm-oracle/
 │   │   ├── config.js       # l3Config / createL3Engine — ORACLE_L3_* settings
 │   │   ├── inference.js    # L3InferenceEngine — any OpenAI-compatible /chat/completions backend
 │   │   ├── prompts.js      # renders prompts/l3/*.txt ({{placeholders}})
-│   │   ├── synthesize.js   # numbered facts -> model -> citation check (shared by MCP and llm bench)
+│   │   ├── synthesize.js   # numbered facts -> model -> claim/citation check (shared by MCP and llm bench)
+│   │   ├── claims.js       # claim-level check: relations against the graph, symbols against facts
 │   │   └── weights-patch.js # WeightsThenPatch — validates citations/paths against L1, drift log
 │   ├── llm/                # Local model server (optional)
 │   │   ├── server.js       # llama-server download (SHA-256) / start / status / stop
@@ -190,6 +191,9 @@ llm-oracle/
 │   ├── scanner.test.js
 │   ├── toon.test.js
 │   ├── weights-patch.test.js
+│   ├── where-would.test.js, conventions-for.test.js, laravel-routes.test.js
+│   ├── serves-route.test.js, grounding-truncation-evidence.test.js, contract-start-lines.test.js
+│   ├── l3-claims.test.js
 │   └── workspace.test.js
 ├── prompts/
 │   ├── l3/                 # L3 prompt templates (*.txt, {{placeholders}}) + bench-tasks.json
@@ -309,6 +313,7 @@ node bin/oracle.js llm bench <ws> <sp>
 - Bump `EXTRACTOR_VERSION` in `src/graph/builder.js` whenever extractor output or edge resolution changes; graphs built by another version are rebuilt in full on the next ingest, unchanged files would otherwise keep stale edges.
 - Incremental builds must equal full rebuilds: global name lookups happen only in the builder's deferred pass, never order by `ref_count` or row ids when choosing a node, and record `soft` refs for anything resolved through another symbol (inheritance path, return type, receiver name).
 - Non-relative imports (tsconfig `paths`, workspace packages, Dart `package:`) resolve through `src/graph/modules.js`.
+- `serves_route` edges point from the handler to the route (all extractors); the store's consumer/impact queries count them the other way, so a route is a user of its handler.
 
 ---
 
@@ -452,11 +457,12 @@ The CLI loads `.env` automatically via `dotenv`. All variables have sensible def
 | `ORACLE_L3_BASE_URL` | _(empty)_ | Any OpenAI-compatible endpoint, e.g. `http://127.0.0.1:8321/v1` (local llama.cpp) |
 | `ORACLE_L3_MODEL` | `default` | Model name, e.g. `Qwen3-4B-Instruct-2507-Q4_K_M` |
 | `ORACLE_L3_API_KEY` | _(empty)_ | Bearer token, if the backend needs one |
-| `ORACLE_L3_TIMEOUT_MS` | `60000` | Deadline for one synthesis call, retries included |
+| `ORACLE_L3_TIMEOUT_MS` | `180000` | Deadline for one synthesis call, retries included |
 | `ORACLE_L3_RETRIES` | `1` | Retries on 429/5xx/connection reset |
 | `ORACLE_L3_MAX_TOKENS` / `ORACLE_L3_CONTEXT_TOKENS` | `32768` / `1500` | Answer cap / prompt budget for facts |
 | `ORACLE_L3_TEMPERATURE` / `ORACLE_L3_REASONING_EFFORT` | `0.2` / _(empty)_ | Sampling; `reasoning_effort` for thinking models |
 | `ORACLE_L3_EXTRA_BODY` / `ORACLE_L3_EXTRA_HEADERS` | _(empty)_ | JSON merged into requests (backend-specific options) |
+| `ORACLE_L3_OUTPUT` | `claims` | `claims`: JSON sentences with claims, each checked against facts and graph relations (`src/l3/claims.js`); `text`: prose + evidence line |
 | `ORACLE_L3_PROMPTS_DIR` | `prompts/l3` | Prompt template directory |
 | `ORACLE_LLM_*` | see `.env.example` | Local llama.cpp server: model repo/file, host/port, context, KV cache, prompt cache, GPU layers, ... |
 | `ORACLE_CONTEXT_MAX_NODES` / `ORACLE_MAX_EVIDENCE` | `50` / `50` | Safety caps on `oracle.context` results / evidence kept when trimming |

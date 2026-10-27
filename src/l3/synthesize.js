@@ -1,4 +1,5 @@
 import { renderTemplate } from './prompts.js';
+import { parseClaimsAnswer, verifyClaims } from './claims.js';
 
 /**
  * L3 synthesis: turn the verified L1/L2 facts of an open-ended tool result
@@ -29,15 +30,23 @@ export async function synthesizeWithL3(ctx, toolName, toolArgs, result, { signal
   }
 
   const relations = relationsBetween(ctx, verified);
-  const { text: l1Context, cited } = buildL1Context({ ...result, evidence: verified }, ctx.l3.contextTokens, relations);
+  const { text: l1Context, cited, shownRelations } = buildL1Context({ ...result, evidence: verified }, ctx.l3.contextTokens, relations);
   let l3Result;
   try {
     l3Result = await ctx.l3.query(questionFor(toolName, toolArgs), { l1Context, signal });
   } catch (err) {
+    // Timeouts and backend errors are logged with the drift so they can be found.
+    ctx.weightsPatch?.recordDrift(ctx.subproject?.id, `L3 call failed: ${err.message}`);
+    if (driftLogPath) {
+      try { ctx.weightsPatch.saveDriftLog(driftLogPath); } catch {}
+    }
     return { result, outcome: { status: 'failed', reason: err.message } };
   }
 
   const stats = { latencyMs: l3Result.latencyMs, usage: l3Result.usage, timings: l3Result.timings, text: l3Result.text };
+  if (ctx.l3.output === 'claims') {
+    return finishClaims(ctx, result, l3Result, { cited, shownRelations, verified, l1Context, stats, driftLogPath });
+  }
   // The model cites facts by their [number] (a few tokens instead of copying
   // paths and line ranges, which was slow and error-prone). Numbers map back
   // to verified facts; an unknown number rejects the answer.
@@ -85,6 +94,75 @@ export async function synthesizeWithL3(ctx, toolName, toolArgs, result, { signal
   };
 }
 
+const MAX_DROPPED_SHARE = 0.5;
+
+/**
+ * Claims mode: keep the sentences whose every claim checks out against the
+ * facts and graph relations; reject the answer when none, or more than half,
+ * survive. Dropped sentences are recorded in the drift log with their reason.
+ */
+function finishClaims(ctx, result, l3Result, { cited, shownRelations, verified, l1Context, stats, driftLogPath }) {
+  const reject = (reason) => {
+    ctx.weightsPatch.recordDrift(ctx.subproject?.id, reason);
+    if (driftLogPath) {
+      try { ctx.weightsPatch.saveDriftLog(driftLogPath); } catch {}
+    }
+    return { result, outcome: { status: 'rejected', reason, ...stats } };
+  };
+
+  const answer = parseClaimsAnswer(l3Result.text);
+  if (!answer) {
+    return reject(l3Result.finishReason === 'length'
+      ? `answer cut at ORACLE_L3_MAX_TOKENS (${ctx.l3.maxTokens}) before the JSON was complete`
+      : 'L3 answer is not the expected JSON ({"sentences": [{"text", "claims"}]})');
+  }
+  const suggestions = [...(result.answer?.proposed_paths || []), ...(result.answer?.create || [])].map(p => p.path);
+  const { kept, dropped, omitted } = verifyClaims(answer, { facts: cited, relations: shownRelations, suggestions });
+  for (const d of dropped) ctx.weightsPatch.recordDrift(ctx.subproject?.id, `L3 claim dropped: ${d.reason}`);
+  const total = kept.length + dropped.length;
+  if (kept.length === 0) return reject(`no sentence passed the claim check (${dropped[0].reason})`);
+  if (dropped.length / total > MAX_DROPPED_SHARE) {
+    return reject(`${dropped.length} of ${total} sentences failed the claim check: ${dropped.map(d => d.reason).join('; ')}`);
+  }
+
+  const ranges = new Map();
+  for (const id of kept.flatMap(k => k.factIds)) {
+    const e = cited.get(id);
+    if (e) ranges.set(`${e.path}:${e.line_range[0]}:${e.line_range[1]}`, { path: e.path, line_range: e.line_range });
+  }
+  const synthesis = { text: kept.map(k => k.text).join(' '), evidence: [...ranges.values()] };
+  const validation = ctx.weightsPatch.validateSynthesis(synthesis, verified, ctx.subproject?.id, {
+    mentionablePaths: pathsIn(l1Context),
+  });
+  if (!validation.accepted) return reject(validation.reason);
+
+  return {
+    result: {
+      ...result,
+      _l3_synthesis: inlineRefs(synthesis.text, cited),
+      _l3_citations: synthesis.evidence,
+      _l3_claims: {
+        sentences: total,
+        verified: kept.length,
+        ...(dropped.length > 0 ? { dropped: dropped.map(d => d.reason) } : {}),
+        ...(omitted > 0 ? { omitted_repeats_or_over_limit: omitted } : {}),
+      },
+      _l3_synthesis_note: UNTRUSTED_NOTE,
+      evidence: verified,
+      layer: 'L3',
+    },
+    outcome: { status: 'accepted', claims: { verified: kept.length, dropped: dropped.length }, ...stats },
+  };
+}
+
+// Inline [n] references spelled out as path:lines so the text stands on its own.
+function inlineRefs(text, cited) {
+  return text.replace(/\[(\d+)\]/g, (match, id) => {
+    const fact = cited.get(Number(id));
+    return fact ? `${fact.path}:${fact.line_range[0]}-${fact.line_range[1]}` : match;
+  });
+}
+
 // Numbers in brackets after the last "evidence" marker, in whatever shape the
 // model wrote them: [1, 3], [1], [3], [3][4] ...
 function citedIds(text) {
@@ -106,10 +184,7 @@ function citedIds(text) {
 // text stands on its own.
 function proseOnly(text, cited) {
   const prose = text.replace(/\n?[^\S\n]*evidence\s*:?[\s\S]*$/i, '').trim() || text;
-  return prose.replace(/\[(\d+)\]/g, (match, id) => {
-    const fact = cited.get(Number(id));
-    return fact ? `${fact.path}:${fact.line_range[0]}-${fact.line_range[1]}` : match;
-  });
+  return inlineRefs(prose, cited);
 }
 
 function pathsIn(text) {
@@ -202,11 +277,13 @@ function buildL1Context(l1Result, budgetTokens = 1500, relations = []) {
       continue;
     }
     nextId++;
-    if (e.line_range) cited.set(id, { path: e.path, line_range: e.line_range });
+    if (e.line_range) cited.set(id, { path: e.path, line_range: e.line_range, symbol: e.symbol, kind: e.kind });
   }
 
   const shown = new Set([...cited.values()].map(c => `${c.path}:${c.line_range[0]}:${c.line_range[1]}`));
   const isShown = (e) => shown.has(`${e.path}:${e.line_range[0]}:${e.line_range[1]}`);
+  // Relations between facts the model saw: the ground truth for its relation claims.
+  const shownRelations = relations.filter(r => isShown(r.from) && isShown(r.to));
   for (const r of relations) {
     if (!isShown(r.from) || !isShown(r.to)) continue;
     const id = nextId;
@@ -219,7 +296,7 @@ function buildL1Context(l1Result, budgetTokens = 1500, relations = []) {
     });
     if (!fits(line)) break;
     nextId++;
-    cited.set(id, { path: r.from.path, line_range: r.from.line_range });
+    cited.set(id, { path: r.from.path, line_range: r.from.line_range, relation: { kind: r.kind, from: r.from.symbol, to: r.to.symbol } });
   }
 
   const a = l1Result.answer;
@@ -250,5 +327,5 @@ function buildL1Context(l1Result, budgetTokens = 1500, relations = []) {
     }));
   }
 
-  return { text: parts.join('\n'), cited };
+  return { text: parts.join('\n'), cited, shownRelations };
 }

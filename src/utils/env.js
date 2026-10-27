@@ -63,6 +63,9 @@ export function validateEnv(env = process.env) {
     const t = Number(value('ORACLE_L3_TEMPERATURE'));
     if (!(t >= 0 && t <= 2)) errors.push(`ORACLE_L3_TEMPERATURE must be between 0 and 2 (got '${value('ORACLE_L3_TEMPERATURE')}')`);
   }
+  if (isSet('ORACLE_L3_OUTPUT') && !['claims', 'text'].includes(value('ORACLE_L3_OUTPUT'))) {
+    errors.push(`ORACLE_L3_OUTPUT must be claims or text (got '${value('ORACLE_L3_OUTPUT')}')`);
+  }
   if (isSet('ORACLE_L3_REASONING_EFFORT') && !['none', 'minimal', 'low', 'medium', 'high'].includes(value('ORACLE_L3_REASONING_EFFORT'))) {
     errors.push(`ORACLE_L3_REASONING_EFFORT must be none, minimal, low, medium or high (got '${value('ORACLE_L3_REASONING_EFFORT')}')`);
   }
